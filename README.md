@@ -25,18 +25,6 @@ This project allows you to upload any PDF and interact with it using a local LLM
    ollama run llama3
 
 
-AI:ML/
-├── rag_ui.py              # Main Streamlit app
-├── ag_streamlit.py        # (Optional) Additional streamlit variant
-├── temp.pdf               # Temporarily saved PDF (uploaded by user)
-├── README.md              # Documentation (see below)
-└── requirements.txt       # All dependencies
 
-pip install -r requirements.txt
-streamlit
-langchain
-langchain-community
-faiss-cpu
-sentence-transformers
 
 
