@@ -42,7 +42,7 @@ flowchart TD
     subgraph "Native Layer (Host)"
         O[Ollama]
         Q[qwen3 Qwen3 Generation]
-        N[nomic-embed-text Embeddings]
+        N[qllama/bge-small-en-v1.5:latest Embeddings]
         O --- Q
         O --- N
     end
@@ -80,7 +80,7 @@ Port 6333 Internal)]
 | **Backend API** | FastAPI + Uvicorn | Dedicated async API orchestration layer separating UI from mechanics. |
 | **Orchestration** | LangChain | Framework tying retrieval + generation. |
 | **Vector Database** | Qdrant | Concurrent-safe, dockerized, persistent volume, replacing FAISS. |
-| **Embeddings** | `nomic-embed-text-v1.5` | Wide 8192 token context window. Rendered via native Ollama. |
+| **Embeddings** | `qllama/bge-small-en-v1.5:latest` | 384-dimensional embeddings served via native Ollama. |
 | **Chunking** | Semantic Chunking | Breaks by conceptual boundaries instead of naive physical characters. |
 | **Sparse Retrieval** | BM25 | Pure keyword lookups for specific nouns and names. |
 | **Reranker** | Flashrank | Fast ONNX CPU reranking to filter top 20 fused candidates to the top 5. |
@@ -97,7 +97,7 @@ Semantic Chunking (respecting meaning, not max length)
        ↓
 Chunk Quality Gate
        ↓
-nomic-embed-text → Qdrant (Dense Index)   +   BM25 (Sparse Index)
+qllama/bge-small-en-v1.5:latest → Qdrant (Dense Index)   +   BM25 (Sparse Index)
        ↓
 Reciprocal Rank Fusion (RRF) -> Top 20
        ↓
@@ -116,10 +116,10 @@ The system requires simple `.env` flag configurations to match your machine powe
 
 | Hardware | Mode | Generation Model | Embedding Model |
 |---|---|---|---|
-| Mac M1/M2/M3/M4 (16GB+) | `performance` | Qwen3 8B | `nomic-embed-text` |
-| Mac M1/M2/M3/M4 (8GB) | `lite` | Qwen3 1.7B | `nomic-embed-text` |
-| Windows/Linux (GPU 8GB+) | `performance` | Qwen3 8B | `nomic-embed-text` |
-| Windows/Linux (CPU 16GB) | `lite` | Qwen3 1.7B | `nomic-embed-text` |
+| Mac M1/M2/M3/M4 (16GB+) | `performance` | Qwen3 8B | `qllama/bge-small-en-v1.5:latest` |
+| Mac M1/M2/M3/M4 (8GB) | `lite` | Qwen3 1.7B | `qllama/bge-small-en-v1.5:latest` |
+| Windows/Linux (GPU 8GB+) | `performance` | Qwen3 8B | `qllama/bge-small-en-v1.5:latest` |
+| Windows/Linux (CPU 16GB) | `lite` | Qwen3 1.7B | `qllama/bge-small-en-v1.5:latest` |
 | Below 8GB RAM | *Not Supported* | — | — |
 
 ---
@@ -131,8 +131,9 @@ Get your private RAG interface running in **under 15 minutes**:
 ### Step 1: Install Ollama (Native)
 Download and install [Ollama](https://ollama.com/) naturally for your OS (Do not containerize).
 ```bash
+ollama pull qllama/bge-small-en-v1.5:latest
 ollama pull qwen3:8b
-ollama pull nomic-embed-text
+ollama pull qwen3:1.7b
 ```
 
 *(Optional: Set `OLLAMA_NUM_PARALLEL=2` to allow concurrent embedding + generation)*

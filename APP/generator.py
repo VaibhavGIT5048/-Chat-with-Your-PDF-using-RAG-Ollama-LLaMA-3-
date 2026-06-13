@@ -1,96 +1,149 @@
-print("[DEBUG] Script started...") # This must print immediately
+from __future__ import annotations
 
 import os
-import json
 import pickle
-import numpy as np
+import time
 from pathlib import Path
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_ollama import OllamaLLM
 
-print(" [DEBUG] Libraries loaded successfully.")
+import httpx
 
-# ─────────────────────────────────────────────────────────────────────
-# 1. RETRIEVAL LOGIC (Integrated to avoid import errors)
-# ─────────────────────────────────────────────────────────────────────
-
-def hybrid_retrieve_standalone(query, vectorstore, bm25, chunks, k=60, top_n=4):
-    print(f"🔍 [DEBUG] Searching for: {query}")
-    # Semantic
-    semantic_results = vectorstore.similarity_search(query, k=10)
-    # Keyword
-    tokenized_query = query.lower().split()
-    keyword_scores = bm25.get_scores(tokenized_query)
-    top_indices = np.argsort(keyword_scores)[::-1][:10]
-    keyword_results = [chunks[i] for i in top_indices if keyword_scores[i] > 0]
-
-    rrf_scores = {}
-    doc_map = {}
-    for rank, doc in enumerate(semantic_results, 1):
-        cid = doc.metadata["chunk_id"]
-        doc_map[cid] = doc
-        rrf_scores[cid] = rrf_scores.get(cid, 0) + 1.0 / (k + rank)
-    for rank, doc in enumerate(keyword_results, 1):
-        cid = doc.metadata["chunk_id"]
-        doc_map[cid] = doc
-        rrf_scores[cid] = rrf_scores.get(cid, 0) + 1.0 / (k + rank)
-
-    sorted_results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
-    return [(doc_map[cid], score) for cid, score in sorted_results[:top_n]]
+from APP.vector_store import (
+    QdrantVectorStore,
+    expand_with_neighbors_scored,
+    flashrank_rerank,
+    hybrid_retrieve,
+)
+from APP.embedding import load_embedding_model
+from qdrant_client import QdrantClient
 
 # ─────────────────────────────────────────────────────────────────────
-# 2. PROMPT & LLM LOGIC
+# SYSTEM PROMPT — strict grounding, zero hallucination
+# Canonical export: api_service.py and ragas_evaluation.py import this.
 # ─────────────────────────────────────────────────────────────────────
+SYSTEM_PROMPT = """\
+You are a document analyst. Your ONLY job is to answer questions using the context below.
 
-SYSTEM_PROMPT = """You are an expert analyst. Answer ONLY using the provided <context>. 
-Cite sources as [Page X]. If unknown, say the document does not contain the info."""
+STRICT RULES (violation = wrong answer):
+1. ONLY use information explicitly stated in the context. NEVER infer, extrapolate, or add general knowledge.
+2. If the context does not contain enough information to answer, say EXACTLY:
+   "I cannot find this information in the provided document."
+3. Do NOT paraphrase facts you are unsure about — quote or closely follow the context wording.
+4. Cite every key claim inline: [Source: <filename> | Page: <page>]
+5. Do NOT answer from memory or training data. The context IS the only valid source.
 
-def run_rag_chat():
-    print("🚩 [DEBUG] Entering run_rag_chat()...")
-    
-    # Check paths
-    idx_path = Path("indexes/faiss_index")
+ANSWERING STYLE:
+- Factual questions: direct answer first, then supporting evidence from context.
+- Explanatory questions: brief explanation + evidence.
+- Comparison questions: compare only what the context explicitly states.
+- If partial information exists: answer what is supported, flag what is missing.
+"""
+
+TOP_N = 5
+
+
+def load_indices():
     bm25_path = Path("indexes/bm25_data.pkl")
-    
-    if not idx_path.exists() or not bm25_path.exists():
-        print(f"❌ Error: Index files not found in /indexes. Run vector_store.py first.")
-        return
+    if not bm25_path.exists():
+        raise FileNotFoundError("indexes/bm25_data.pkl not found. Run /ingest first.")
 
-    # Load everything
-    print("🔄 Loading indices into memory...")
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-    vectorstore = FAISS.load_local(str(idx_path), embeddings, allow_dangerous_deserialization=True)
-    
+    print("🔄 Loading BM25 index...")
     with open(bm25_path, "rb") as f:
         data = pickle.load(f)
-        bm25, chunks = data["bm25"], data["chunks"]
+    bm25 = data["bm25"]
+    chunks = data["chunks"]
 
-    print("\n✅ RAG SYSTEM READY. Type 'exit' to quit.")
-    
-    llm = OllamaLLM(model="llama3", temperature=0)
+    print("🔄 Connecting to Qdrant...")
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    client = QdrantClient(url=qdrant_url)
+    embeddings = load_embedding_model(
+        os.getenv("EMBEDDING_MODEL", "qllama/bge-small-en-v1.5")
+    )
+    vectorstore = QdrantVectorStore(
+        client=client,
+        collection_name=os.getenv("QDRANT_COLLECTION", "chunks_collection"),
+        embeddings=embeddings,
+    )
+
+    print("🔥 Warming up reranker...")
+    if chunks:
+        flashrank_rerank("warmup query", chunks[:1], k=1)
+    print("✅ Reranker ready")
+
+    return vectorstore, bm25, chunks
+
+
+def generate_answer(prompt: str, model: str, ollama_url: str) -> str:
+    payload = {
+        "model": model,
+        "think": False,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0,
+            "num_predict": 512,
+        },
+    }
+    with httpx.Client(timeout=120.0) as client:
+        resp = client.post(f"{ollama_url}/api/generate", json=payload)
+        resp.raise_for_status()
+    data = resp.json()
+    return data.get("response", "").strip() if isinstance(data, dict) else str(data)
+
+
+def run_rag_chat():
+    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
+    model = os.getenv("OLLAMA_GENERATOR_MODEL", "qwen3:8b")
+
+    vectorstore, bm25, chunks = load_indices()
+    print(f"\n✅ RAG SYSTEM READY ({len(chunks)} chunks indexed)")
+    print(f"   Model     : {model}")
+    print(f"   Top-N     : {TOP_N}")
+    print(f"   Ollama    : {ollama_url}")
+    print("   Type 'exit' to quit.\n")
 
     while True:
-        query = input("\n👤 Question: ")
-        if query.lower() in ["exit", "quit"]: break
+        query = input("👤 Question: ").strip()
+        if not query:
+            continue
+        if query.lower() in {"exit", "quit"}:
+            break
 
-        # Retrieve
-        results = hybrid_retrieve_standalone(query, vectorstore, bm25, chunks)
-        
-        # Build Context
-        context_text = "\n\n".join([f"--- Page {d.metadata['page']} ---\n{d.page_content}" for d, s in results])
-        
-        # Build Prompt
-        full_prompt = f"{SYSTEM_PROMPT}\n\n<context>\n{context_text}\n</context>\n\nUser Question: {query}"
-        
-        print("🤖 Llama-3 is thinking...")
-        answer = llm.invoke(full_prompt)
-        print(f"\n📝 ANSWER:\n{answer}\n")
+        t0 = time.perf_counter()
+        results = hybrid_retrieve(query, vectorstore, bm25, chunks, top_n=TOP_N)
+        retrieval_ms = (time.perf_counter() - t0) * 1000
 
-# ─────────────────────────────────────────────────────────────────────
-# 3. GLOBAL EXECUTION (This ensures the script runs)
-# ─────────────────────────────────────────────────────────────────────
+        if not results:
+            print("⚠️  No relevant chunks found.\n")
+            continue
 
-print("🚩 [DEBUG] Main block reached.")
-run_rag_chat()
+        expanded = expand_with_neighbors_scored(results=results, chunks=chunks, window=1)
+
+        context_parts = []
+        for doc, score in expanded:
+            source = doc.metadata.get("source", "unknown")
+            page = doc.metadata.get("page", "?")
+            context_parts.append(
+                f"[Source: {source} | Page: {page} | Score: {score:.3f}]\n"
+                f"{doc.page_content}"
+            )
+        context_blob = "\n\n---\n\n".join(context_parts)
+
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\n"
+            f"CONTEXT:\n{context_blob}\n\n"
+            f"QUESTION: {query}\n\n"
+            f"ANSWER (use ONLY the context above):"
+        )
+
+        t1 = time.perf_counter()
+        print(f"\n🤖 Generating... (retrieval: {retrieval_ms:.0f}ms)", flush=True)
+        answer = generate_answer(prompt, model=model, ollama_url=ollama_url)
+        generation_ms = (time.perf_counter() - t1) * 1000
+        total_ms = retrieval_ms + generation_ms
+
+        print(f"\n📝 ANSWER:\n{answer}")
+        print(f"\n⏱  retrieval={retrieval_ms:.0f}ms  generation={generation_ms:.0f}ms  total={total_ms:.0f}ms\n")
+
+
+if __name__ == "__main__":
+    run_rag_chat()

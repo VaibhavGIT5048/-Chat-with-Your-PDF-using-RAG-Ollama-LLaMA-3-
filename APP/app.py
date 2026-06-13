@@ -1,186 +1,132 @@
+from __future__ import annotations
+
 import os
-import sys
-from pathlib import Path
+from time import perf_counter
+
+import requests
+import streamlit as st
 from dotenv import load_dotenv
+from requests.exceptions import ConnectionError
 
 load_dotenv()
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
-import streamlit as st
-from langchain_core.documents import Document
-from langchain_ollama import OllamaLLM
-
-from APP.chunking import chunk_documents, save_chunks_jsonl
-from APP.pdf_loading import load_pdf, load_pdfs
-from APP.quality_gate import apply_quality_gate, save_chunks_jsonl as save_processed_jsonl
-from APP.vector_store import build_hybrid_indices, hybrid_retrieve, expand_with_neighbors
-
-host = os.getenv("OLLAMA_HOST")
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 
-DEFAULT_MODEL = "llama3.1:8b"
+def api_health() -> bool:
+    try:
+        resp = requests.get(f"{API_URL}/health", timeout=3)
+        return resp.status_code == 200
+    except (ConnectionError, requests.Timeout):
+        return False
 
 
-def build_prompt(question: str, contexts: list[str]) -> str:
-    context_blob = "\n\n".join(contexts)
-    return f"""You are an expert document analyst and retrieval-augmented AI assistant.
-
-Your task is to answer the user's question using ONLY the information provided in the retrieved document context.
-
-INSTRUCTIONS:
-
-1. Read ALL retrieved chunks carefully before answering.
-2. Information may be distributed across multiple chunks.
-3. Combine and synthesize information from different chunks whenever necessary.
-4. If a principle, concept, case study, example, statistic, recommendation, or conclusion appears in separate chunks, connect them logically.
-5. If the answer is partially available across multiple chunks, construct the most complete answer possible.
-6. Prioritize factual accuracy over brevity.
-7. Do NOT invent, assume, or hallucinate information that is not supported by the context.
-8. If page numbers are available in the context metadata, mention them when relevant.
-9. If the context contains enough evidence to reasonably infer the answer, provide the answer.
-10. Only respond with "I cannot find this information in the document." when NONE of the retrieved context is relevant to the question.
-11. Cite sources inline using this format: [Source: <pdf_name> | Page: <page_no>] for key claims.
-
-ANSWERING RULES:
-
-* For factual questions: provide a direct answer followed by supporting details.
-* For explanatory questions: provide a concise explanation followed by evidence from the context.
-* For comparison questions: compare all relevant information found across chunks.
-* For summary questions: synthesize the key ideas from all relevant chunks.
-* For analytical questions: connect related information across chunks and explain the relationship.
-
-CONTEXT:
-{context_blob}
-
-QUESTION:
-{question}
-
-FINAL ANSWER:
-"""
-
-
-def process_uploaded_pdf(
-    pdf_path: Path,
-    chunk_size: int,
-    chunk_overlap: int,
-    quality_threshold: float,
-) -> tuple[object, object, list[Document], list[Document], dict]:
-    pages = load_pdf(pdf_path)
-    docs = [Document(page_content=p.page_content, metadata=p.metadata) for p in pages]
-    chunks = chunk_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-
-    Path("chunks").mkdir(parents=True, exist_ok=True)
-    save_chunks_jsonl(chunks, "chunks/chunks.jsonl")
-
-    processed_chunks = apply_quality_gate(chunks, threshold_score=quality_threshold)
-    save_processed_jsonl(processed_chunks, "chunks/chunks_processed.jsonl")
-    passed_chunks = [c for c in processed_chunks if c.metadata.get("passed_gate") is True]
-    retrieval_chunks = [c for c in processed_chunks if c.page_content.strip()]
-
-    if not retrieval_chunks:
-        raise RuntimeError("No retrievable chunks were produced. Inspect document extraction quality.")
-
-    vectorstore, bm25 = build_hybrid_indices(retrieval_chunks)
-    stats = {
-        "pages": len(docs),
-        "chunks": len(chunks),
-        "passed_chunks": len(passed_chunks),
-        "dropped_chunks": len(chunks) - len(passed_chunks),
-        "indexed_chunks": len(retrieval_chunks),
+def api_ingest(filename: str, file_bytes: bytes, chunk_size: int, chunk_overlap: int, quality_threshold: float):
+    files = {"file": (filename, file_bytes)}
+    data = {
+        "chunk_size": chunk_size,
+        "chunk_overlap": chunk_overlap,
+        "quality_threshold": quality_threshold,
     }
-    return vectorstore, bm25, retrieval_chunks, processed_chunks, stats
+    started = perf_counter()
+    resp = requests.post(f"{API_URL}/ingest", files=files, data=data, timeout=120)
+    latency_ms = round((perf_counter() - started) * 1000, 2)
+    resp.raise_for_status()
+    return resp.json(), latency_ms
+
+
+def api_query(question: str, top_k: int):
+    started = perf_counter()
+    resp = requests.post(f"{API_URL}/query", json={"question": question, "top_k": top_k}, timeout=120)
+    latency_ms = round((perf_counter() - started) * 1000, 2)
+    resp.raise_for_status()
+    return resp.json(), latency_ms
+
+
+def render_sources(sources: list[dict]) -> None:
+    if not sources:
+        st.info("No sources returned for this answer.")
+        return
+
+    with st.expander("Retrieved Chunks", expanded=True):
+        for idx, source_chunk in enumerate(sources, start=1):
+            st.markdown(
+                f"**#{idx}** | Score: `{source_chunk.get('score', 0):.4f}` | "
+                f"Source: `{source_chunk.get('source')}` | Page: `{source_chunk.get('page')}`"
+            )
+            st.write(source_chunk.get("content", "")[:900])
+            st.divider()
 
 
 def main() -> None:
-    st.set_page_config(page_title="RAG PDF Chat", layout="wide")
-    st.title("RAG PDF Chat")
-    st.caption("Upload PDF -> chunk -> quality gate -> hybrid index -> chat. Evaluation is separate.")
+    st.set_page_config(page_title="RAG Test UI", layout="wide")
+    st.title("RAG Test UI")
+    st.caption("Streamlit test client for the REST API backend")
+
+    if not api_health():
+        st.error(f"API backend is not reachable at {API_URL}")
+        st.stop()
+
+    st.success(f"Connected to API at {API_URL}")
 
     with st.sidebar:
-        st.subheader("Pipeline Settings")
-        model_name = st.text_input("Ollama model", value=DEFAULT_MODEL)
-        chunk_size = st.slider("Chunk size", min_value=400, max_value=2000, value=1000, step=100)
-        chunk_overlap = st.slider("Chunk overlap", min_value=50, max_value=400, value=150, step=25)
-        quality_threshold = st.slider("Quality threshold", min_value=0.0, max_value=7.0, value=4.0, step=0.5)
-        top_n = st.slider("Retrieved chunks", min_value=1, max_value=8, value=4)
-        show_sources = st.checkbox("Show retrieved chunks", value=True)
+        st.subheader("Test Controls")
+        chunk_size = st.slider("Chunk size", 400, 2000, 1000, 100)
+        chunk_overlap = st.slider("Chunk overlap", 50, 400, 150, 25)
+        quality_threshold = st.slider("Quality threshold", 0.0, 7.0, 4.0, 0.5)
+        top_k = st.slider("Retrieved chunks", 1, 8, 4)
+        auto_clear = st.checkbox("Clear chat after ingest", value=True)
 
-    uploaded_files = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-    if uploaded_files:
-        data_dir = Path("data")
-        data_dir.mkdir(parents=True, exist_ok=True)
-        saved_paths = []
-        for uf in uploaded_files:
-            pdf_path = data_dir / uf.name
-            with open(pdf_path, "wb") as f:
-                f.write(uf.getbuffer())
-            saved_paths.append(pdf_path)
-
-        st.session_state.pdf_names = [p.name for p in saved_paths]
-        st.success(f"Uploaded {len(saved_paths)} PDFs")
-
-        if st.button("Process PDFs and Build RAG Index", type="primary"):
-            with st.spinner("Running PDF loading, chunking, quality gate, and indexing..."):
-                try:
-                    pages = load_pdfs(saved_paths)
-                    docs = [Document(page_content=p.page_content, metadata=p.metadata) for p in pages]
-                    chunks = chunk_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-
-                    Path("chunks").mkdir(parents=True, exist_ok=True)
-                    save_chunks_jsonl(chunks, "chunks/chunks.jsonl")
-
-                    processed_chunks = apply_quality_gate(chunks, threshold_score=quality_threshold)
-                    save_processed_jsonl(processed_chunks, "chunks/chunks_processed.jsonl")
-                    passed_chunks = [c for c in processed_chunks if c.metadata.get("passed_gate") is True]
-                    retrieval_chunks = [c for c in processed_chunks if c.page_content.strip()]
-
-                    if not retrieval_chunks:
-                        raise RuntimeError("No retrievable chunks were produced. Inspect document extraction quality.")
-
-                    vectorstore, bm25 = build_hybrid_indices(retrieval_chunks)
-                    stats = {
-                        "pdfs": len(saved_paths),
-                        "pages": len(docs),
-                        "chunks": len(chunks),
-                        "passed_chunks": len(passed_chunks),
-                        "dropped_chunks": len(chunks) - len(passed_chunks),
-                        "indexed_chunks": len(retrieval_chunks),
-                    }
-                except Exception as exc:
-                    st.error(f"Pipeline failed: {exc}")
-                    return
-
-            st.session_state.vectorstore = vectorstore
-            st.session_state.bm25 = bm25
-            st.session_state.retrieval_chunks = retrieval_chunks
-            st.session_state.chunks = processed_chunks
-            st.session_state.pipeline_stats = stats
-            st.session_state.chat_history = []
-            st.success("Multi-PDF RAG pipeline is ready for chat.")
-
-    if "pipeline_stats" in st.session_state:
-        s = st.session_state.pipeline_stats
-        st.info(
-            f"PDFs: {s.get('pdfs', 1)} | Pages: {s['pages']} | Chunks: {s['chunks']} | "
-            f"Passed Gate: {s['passed_chunks']} | Failed Gate: {s['dropped_chunks']} | "
-            f"Indexed: {s.get('indexed_chunks', s['passed_chunks'])}"
-        )
-
-    if "vectorstore" not in st.session_state:
-        st.warning("Upload and process a PDF to start chatting.")
-        return
+    uploaded_files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
+    ingest_requested = st.button("Ingest PDFs", type="primary", disabled=not uploaded_files)
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "pipeline_stats" not in st.session_state:
+        st.session_state.pipeline_stats = None
+
+    if ingest_requested and uploaded_files:
+        for uploaded_file in uploaded_files:
+            st.write(f"Ingesting `{uploaded_file.name}`")
+            try:
+                result, ingest_latency_ms = api_ingest(
+                    filename=uploaded_file.name,
+                    file_bytes=uploaded_file.getvalue(),
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    quality_threshold=quality_threshold,
+                )
+            except requests.HTTPError as exc:
+                st.error(f"Ingest failed for {uploaded_file.name}: {exc.response.status_code} {exc.response.text}")
+                st.stop()
+            except (ConnectionError, requests.Timeout) as exc:
+                st.error(f"API connection failed during ingest: {exc}")
+                st.stop()
+
+            st.session_state.pipeline_stats = result
+            st.metric("Ingest latency", f"{ingest_latency_ms} ms")
+            st.json(result)
+
+        if auto_clear:
+            st.session_state.chat_history = []
+
+    if st.session_state.pipeline_stats:
+        stats = st.session_state.pipeline_stats
+        st.info(
+            f"Filename: {stats.get('filename')} | Pages: {stats.get('pages')} | Chunks: {stats.get('chunks')} | "
+            f"Passed: {stats.get('passed_chunks')} | Dropped: {stats.get('dropped_chunks')} | "
+            f"Indexed: {stats.get('indexed_chunks')}"
+        )
+
+    if uploaded_files is None:
+        st.warning("Upload and ingest a PDF to start querying.")
+        return
 
     for item in st.session_state.chat_history:
         with st.chat_message(item["role"]):
             st.markdown(item["content"])
 
-    question = st.chat_input("Ask a question about the uploaded PDF...")
+    question = st.chat_input("Ask a question about the ingested PDF...")
     if not question:
         return
 
@@ -189,56 +135,22 @@ def main() -> None:
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Retrieving context and generating answer..."):
+        with st.spinner("Querying API..."):
             try:
-                results = hybrid_retrieve(
-                    query=question,
-                    vectorstore=st.session_state.vectorstore,
-                    bm25=st.session_state.bm25,
-                    chunks=st.session_state.get("retrieval_chunks", st.session_state.chunks),
-                    top_n=top_n,
-                )
-                expanded_docs = expand_with_neighbors(
-                    results=results,
-                    chunks=st.session_state.chunks,
-                    window=1,
-                )
-                contexts = []
-                for doc in expanded_docs:
-                    source = doc.metadata.get("source", "unknown.pdf")
-                    page = doc.metadata.get("page", "?")
-                    contexts.append(f"[Source: {source} | Page: {page}] {doc.page_content}")
-                prompt = build_prompt(question, contexts)
-                stats = st.session_state.get("pipeline_stats", {})
-                trace_config = {
-                    "metadata": {
-                        "pdf_name": ", ".join(st.session_state.get("pdf_names", ["unknown"])),
-                        "quality_threshold": quality_threshold,
-                        "chunks_retrieved": top_n,
-                        "chunks_total": stats.get("chunks", 0),
-                        "chunks_indexed": stats.get("indexed_chunks", 0),
-                    }
-                }
-                llm = OllamaLLM(model=model_name, temperature=0)
-                answer = llm.invoke(prompt, config=trace_config)
-            except Exception as exc:
-                st.error(f"RAG request failed: {exc}")
-                return
+                response, query_latency_ms = api_query(question, top_k)
+            except requests.HTTPError as exc:
+                st.error(f"Query failed: {exc.response.status_code} {exc.response.text}")
+                st.stop()
+            except (ConnectionError, requests.Timeout) as exc:
+                st.error(f"API connection failed during query: {exc}")
+                st.stop()
 
+        answer = response.get("answer", "No answer generated")
+        sources = response.get("sources", [])
         st.markdown(answer)
+        st.caption(f"Query latency: {query_latency_ms} ms")
         st.session_state.chat_history.append({"role": "assistant", "content": answer})
-
-        if show_sources:
-            with st.expander("Retrieved Chunks"):
-                for idx, (doc, score) in enumerate(results, start=1):
-                    source = doc.metadata.get("source", "unknown.pdf")
-                    page = doc.metadata.get("page", "?")
-                    chunk_id = doc.metadata.get("chunk_id", "?")
-                    st.markdown(
-                        f"**#{idx}** | Score: `{score:.4f}` | Source: `{source}` | Page: `{page}` | Chunk: `{chunk_id}`"
-                    )
-                    st.write(doc.page_content[:800] + ("..." if len(doc.page_content) > 800 else ""))
-                    st.divider()
+        render_sources(sources)
 
 
 if __name__ == "__main__":

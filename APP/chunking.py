@@ -1,23 +1,60 @@
+import os
 import json
 from langchain_core.documents import Document
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pathlib import Path
 
+from langchain_ollama import OllamaEmbeddings
+
+try:
+    from langchain_experimental.text_splitter import SemanticChunker
+except Exception:
+    SemanticChunker = None
+
+try:
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+except Exception:
+    RecursiveCharacterTextSplitter = None
 
 def chunk_documents(
     documents: list[Document],
     chunk_size: int = 1000,
     chunk_overlap: int = 150,
 ) -> list[Document]:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ". ", " ", ""],
-        length_function=len,
-        is_separator_regex=False,
-    )
-
-    chunks = splitter.split_documents(documents)
+    if SemanticChunker is not None:
+        try:
+            emb = OllamaEmbeddings(
+                model="qllama/bge-small-en-v1.5:latest",
+                base_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
+            )
+            chunker = SemanticChunker(
+                embeddings=emb,
+                breakpoint_threshold_type="percentile",
+            )
+            chunks = chunker.split_documents(documents)
+            print("✅ Using SemanticChunker with qllama/bge-small-en-v1.5:latest via Ollama")
+        except Exception as e:
+            print(f"⚠️ SemanticChunker path failed: {e}; falling back to RecursiveCharacterTextSplitter")
+            if RecursiveCharacterTextSplitter is None:
+                raise RuntimeError("No available text splitter found.")
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                separators=["\n\n", "\n", ". ", " ", ""],
+                length_function=len,
+                is_separator_regex=False,
+            )
+            chunks = splitter.split_documents(documents)
+    else:
+        if RecursiveCharacterTextSplitter is None:
+            raise RuntimeError("RecursiveCharacterTextSplitter not available; cannot chunk documents.")
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", ". ", " ", ""],
+            length_function=len,
+            is_separator_regex=False,
+        )
+        chunks = splitter.split_documents(documents)
 
     for i, chunk in enumerate(chunks):
         chunk.metadata["chunk_id"]   = i
