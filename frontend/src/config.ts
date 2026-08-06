@@ -7,10 +7,10 @@ export const API_BASE_URL =
 
 export const SITE_URL =
   process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/+$/, '') ||
-  'https://vaibhavgit5048.github.io/Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama'
+  'https://vaibhavgit5048.github.io/private-rag-core'
 
 export const REPO_URL =
-  'https://github.com/VaibhavGIT5048/Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama'
+  'https://github.com/VaibhavGIT5048/private-rag-core'
 
 export const ROUTES = {
   health: '/health',

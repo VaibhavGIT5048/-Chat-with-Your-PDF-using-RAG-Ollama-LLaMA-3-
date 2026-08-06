@@ -47,7 +47,7 @@ services:
       args:
         BASE_PATH: ""
         NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
-        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-https://vaibhavgit5048.github.io/Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama/}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-https://vaibhavgit5048.github.io/private-rag-core/}
     restart: unless-stopped
     ports:
       - "3000:3000"

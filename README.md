@@ -142,8 +142,8 @@ Make sure [Docker Desktop](https://www.docker.com/) is installed and running.
 
 ### Step 2: Clone & Configure
 ```bash
-git clone https://github.com/VaibhavGIT5048/Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama.git
-cd Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama
+git clone https://github.com/VaibhavGIT5048/private-rag-core.git
+cd private-rag-core
 
 # Copy environment config
 cp .env.example .env
