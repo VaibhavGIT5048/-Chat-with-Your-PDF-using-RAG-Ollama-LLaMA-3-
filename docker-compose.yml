@@ -41,6 +41,7 @@ services:
       - rag-net
 
   frontend:
+    image: private-rag-core-frontend:latest
     build:
       context: .
       dockerfile: docker/Dockerfile.frontend
