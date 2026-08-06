@@ -6,15 +6,16 @@ import pickle
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import Any
 from uuid import uuid4
 
-import httpx
 from langchain_core.documents import Document
+from openai import OpenAI
 from qdrant_client import QdrantClient
 
 from APP.chunking import chunk_documents, save_chunks_jsonl
-from APP.embedding import load_embedding_model
+from APP.embedding import DEFAULT_EMBEDDING_MODEL, load_embedding_model
 from APP.generator import SYSTEM_PROMPT
 from APP.pdf_loading import load_pdf
 from APP.quality_gate import apply_quality_gate, save_chunks_jsonl as save_processed_jsonl
@@ -32,19 +33,23 @@ class BackendSettings:
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_api_key: str | None = os.getenv("QDRANT_API_KEY")
     qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "chunks_collection")
-    ollama_url: str = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    ollama_model: str = os.getenv("OLLAMA_GENERATOR_MODEL", "qwen3:8b")
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "qllama/bge-small-en-v1.5:latest")
+    openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
+    openai_chat_model: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    openai_health_ttl: float = float(os.getenv("OPENAI_HEALTH_TTL", "60"))
 
 
 class RAGService:
     def __init__(self, settings: BackendSettings | None = None):
         self.settings = settings or BackendSettings()
         self.qdrant = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
+        self.openai_client = OpenAI(api_key=self.settings.openai_api_key)
         self.embedding_adapter = load_embedding_model(self.settings.embedding_model)
         self._cached_chunks: list[Document] = []
         self._cached_bm25 = None
         self._cached_vectorstore = None
+        self._openai_probe_ok = False
+        self._openai_probe_at: float | None = None
 
     def collection_exists(self, name: str | None = None) -> bool:
         collection_name = name or self.settings.qdrant_collection
@@ -115,11 +120,11 @@ class RAGService:
             raise ValueError(f"No text could be extracted from {filename}")
 
         chunks = chunk_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        Path("chunks").mkdir(parents=True, exist_ok=True)
-        save_chunks_jsonl(chunks, "chunks/chunks.jsonl")
+        Path("data/chunks").mkdir(parents=True, exist_ok=True)
+        save_chunks_jsonl(chunks, "data/chunks/chunks.jsonl")
 
         processed_chunks = apply_quality_gate(chunks, threshold_score=quality_threshold)
-        save_processed_jsonl(processed_chunks, "chunks/chunks_processed.jsonl")
+        save_processed_jsonl(processed_chunks, "data/chunks/chunks_processed.jsonl")
         passed_chunks = [c for c in processed_chunks if c.metadata.get("passed_gate") is True]
         retrieval_chunks = [c for c in processed_chunks if c.page_content.strip()]
 
@@ -149,7 +154,7 @@ class RAGService:
         if self._cached_vectorstore is not None and self._cached_bm25 is not None and self._cached_chunks:
             return self._cached_vectorstore, self._cached_bm25, self._cached_chunks
 
-        bm25_path = Path("indexes/bm25_data.pkl")
+        bm25_path = Path("data/indexes/bm25_data.pkl")
         if not bm25_path.exists():
             raise FileNotFoundError("BM25 artifacts not found. Run /ingest first.")
 
@@ -207,27 +212,25 @@ class RAGService:
             request_id=str(uuid4()),
             answer=answer,
             sources=sources,
-            model=self.settings.ollama_model,
+            model=self.settings.openai_chat_model,
             collection_name=self.settings.qdrant_collection,
         )
 
     def health(self) -> HealthStatus:
         qdrant_status = "down"
-        ollama_status = "down"
         try:
             self.qdrant.get_collections()
             qdrant_status = "up"
         except Exception:
             qdrant_status = "down"
 
-        model_names = self._list_ollama_models()
-        ollama_status = "up" if self.settings.ollama_model in model_names else "down"
+        openai_status = "up" if self._check_openai() else "down"
 
         return HealthStatus(
-            status="ok" if qdrant_status == "up" and ollama_status == "up" else "degraded",
+            status="ok" if qdrant_status == "up" and openai_status == "up" else "degraded",
             service="rag-api",
             qdrant=qdrant_status,
-            ollama=ollama_status,
+            openai=openai_status,
             collection_name=self.settings.qdrant_collection,
         )
 
@@ -240,36 +243,34 @@ class RAGService:
             f"ANSWER:\n"
         )
 
-    def _list_ollama_models(self) -> list[str]:
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                response = client.get(f"{self.settings.ollama_url}/api/tags")
-                response.raise_for_status()
-        except Exception:
-            return []
+    def _check_openai(self) -> bool:
+        """Probe OpenAI reachability, cached for OPENAI_HEALTH_TTL seconds.
 
-        payload = response.json()
-        models = payload.get("models", []) if isinstance(payload, dict) else []
-        names = []
-        for item in models:
-            if isinstance(item, dict):
-                name = item.get("model") or item.get("name")
-                if name:
-                    names.append(name)
-        return names
+        /health is polled frequently (container healthcheck, UI status badge). Without
+        caching, every poll costs a network round-trip to OpenAI — slow enough to trip
+        short client timeouts and make a healthy backend look unreachable.
+        """
+        if not self.settings.openai_api_key:
+            return False
+
+        now = monotonic()
+        if self._openai_probe_at is not None and (now - self._openai_probe_at) < self.settings.openai_health_ttl:
+            return self._openai_probe_ok
+
+        try:
+            self.openai_client.models.retrieve(self.settings.openai_chat_model)
+            self._openai_probe_ok = True
+        except Exception:
+            self._openai_probe_ok = False
+
+        self._openai_probe_at = now
+        return self._openai_probe_ok
 
     def _generate_answer(self, prompt: str) -> str:
-        payload = {
-            "model": self.settings.ollama_model,
-            "think": False,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": 0, "num_predict": 512},
-        }
-        with httpx.Client(timeout=120.0) as client:
-            response = client.post(f"{self.settings.ollama_url}/api/generate", json=payload)
-            response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict):
-            return data.get("response", "")
-        return str(data)
+        response = self.openai_client.chat.completions.create(
+            model=self.settings.openai_chat_model,
+            temperature=0,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.choices[0].message.content or ""

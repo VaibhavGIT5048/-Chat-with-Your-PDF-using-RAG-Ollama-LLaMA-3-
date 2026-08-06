@@ -1,5 +1,7 @@
+# syntax=docker/dockerfile:1
+
 # Stage 1: Builder
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -7,9 +9,12 @@ WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install dependencies
+# Install dependencies. The cache mount persists pip's download/wheel cache
+# across builds (in BuildKit's build cache, not an image layer), so unchanged
+# packages are never re-downloaded even when requirements.txt changes.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements.txt
 
 # Stage 2: Runtime
 FROM python:3.11-slim
@@ -25,8 +30,9 @@ ENV PYTHONPATH="/home/appuser/app"
 RUN useradd --create-home appuser
 
 # Pre-create volume mount points with correct ownership
-RUN mkdir -p /home/appuser/app/chunks /home/appuser/app/indexes \
-    && chown -R appuser:appuser /home/appuser/app/chunks /home/appuser/app/indexes
+RUN mkdir -p /home/appuser/app/data/chunks /home/appuser/app/data/indexes \
+             /home/appuser/app/data/evals /home/appuser/app/data/flashrank_cache \
+    && chown -R appuser:appuser /home/appuser/app/data
 
 USER appuser
 WORKDIR /home/appuser/app
@@ -36,4 +42,6 @@ COPY --chown=appuser:appuser APP/ ./APP/
 
 # Expose port and run application
 EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)" || exit 1
 CMD ["uvicorn", "APP.main:app", "--host", "0.0.0.0", "--port", "8000"]

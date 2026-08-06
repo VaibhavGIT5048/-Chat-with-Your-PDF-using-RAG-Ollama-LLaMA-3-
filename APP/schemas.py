@@ -41,7 +41,7 @@ class HealthStatus(BaseModel):
     status: str
     service: str
     qdrant: str
-    ollama: str
+    openai: str
     collection_name: str | None = None
 
 

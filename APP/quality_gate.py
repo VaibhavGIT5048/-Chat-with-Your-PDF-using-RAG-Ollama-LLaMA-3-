@@ -1,149 +1,189 @@
-from __future__ import annotations
-
-import os
-import pickle
-import time
+import argparse
+import json
+import re
 from pathlib import Path
-
-import httpx
-
-from APP.vector_store import (
-    QdrantVectorStore,
-    expand_with_neighbors_scored,
-    flashrank_rerank,
-    hybrid_retrieve,
-)
-from APP.embedding import load_embedding_model
-from qdrant_client import QdrantClient
+import tiktoken
+from dotenv import load_dotenv
+from langchain_core.documents import Document
 
 # ─────────────────────────────────────────────────────────────────────
-# SYSTEM PROMPT — strict grounding, zero hallucination
-# Canonical export: api_service.py and ragas_evaluation.py import this.
+# CONFIGURATION & INITIALIZATION
 # ─────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """\
-You are a document analyst. Your ONLY job is to answer questions using the context below.
+load_dotenv()
 
-STRICT RULES (violation = wrong answer):
-1. ONLY use information explicitly stated in the context. NEVER infer, extrapolate, or add general knowledge.
-2. If the context does not contain enough information to answer, say EXACTLY:
-   "I cannot find this information in the provided document."
-3. Do NOT paraphrase facts you are unsure about — quote or closely follow the context wording.
-4. Cite every key claim inline: [Source: <filename> | Page: <page>]
-5. Do NOT answer from memory or training data. The context IS the only valid source.
+tokenizer = tiktoken.get_encoding("cl100k_base")
 
-ANSWERING STYLE:
-- Factual questions: direct answer first, then supporting evidence from context.
-- Explanatory questions: brief explanation + evidence.
-- Comparison questions: compare only what the context explicitly states.
-- If partial information exists: answer what is supported, flag what is missing.
-"""
-
-TOP_N = 5
+# Lazy embedding adapter — uses OpenAI embeddings (same model as the rest of the stack)
+# No torch/sentence_transformers needed; loads only on first /ingest call
+_embedder = None
 
 
-def load_indices():
-    bm25_path = Path("indexes/bm25_data.pkl")
-    if not bm25_path.exists():
-        raise FileNotFoundError("indexes/bm25_data.pkl not found. Run /ingest first.")
+def _get_embedder():
+    global _embedder
+    if _embedder is None:
+        from APP.embedding import load_embedding_model
+        _embedder = load_embedding_model()
+    return _embedder
 
-    print("🔄 Loading BM25 index...")
-    with open(bm25_path, "rb") as f:
-        data = pickle.load(f)
-    bm25 = data["bm25"]
-    chunks = data["chunks"]
 
-    print("🔄 Connecting to Qdrant...")
-    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
-    client = QdrantClient(url=qdrant_url)
-    embeddings = load_embedding_model(
-        os.getenv("EMBEDDING_MODEL", "qllama/bge-small-en-v1.5")
-    )
-    vectorstore = QdrantVectorStore(
-        client=client,
-        collection_name=os.getenv("QDRANT_COLLECTION", "chunks_collection"),
-        embeddings=embeddings,
+W_TOKENS, W_PUNC, W_ENTITIES, W_OVERLAP = 2, 2, 1, 2
+MAX_SCORE = 7
+TOKEN_MIN, TOKEN_MAX = 50, 300
+URL_COUNT_MAX, URL_CHAR_RATIO_MAX = 2, 0.15
+URL_PATTERN = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+GOOD_END = {".", "!", "?"}
+WEAK_END = {";"}
+
+
+def _content_richness(text: str) -> float:
+    """Fraction of characters that are alphabetic."""
+    return sum(c.isalpha() for c in text) / max(len(text), 1)
+
+
+def _same_section(prev: Document, curr: Document) -> bool:
+    return (
+        prev.metadata.get("page") == curr.metadata.get("page")
+        or prev.metadata.get("section") == curr.metadata.get("section")
     )
 
-    print("🔥 Warming up reranker...")
-    if chunks:
-        flashrank_rerank("warmup query", chunks[:1], k=1)
-    print("✅ Reranker ready")
 
-    return vectorstore, bm25, chunks
+def _cosine_sim(a: list[float], b: list[float]) -> float:
+    """Pure-Python cosine similarity — no sklearn/numpy required."""
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
-def generate_answer(prompt: str, model: str, ollama_url: str) -> str:
-    payload = {
-        "model": model,
-        "think": False,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0,
-            "num_predict": 512,
-        },
+# ─────────────────────────────────────────────────────────────────────
+# THE REFINED QUALITY EVALUATOR
+# ─────────────────────────────────────────────────────────────────────
+def evaluate_chunk_refined(current_chunk: Document, previous_chunk: Document | None) -> dict:
+    text = current_chunk.page_content.strip()
+    score = 0.0
+    features = {"X_T": 0, "X_P": 0, "X_E": 0, "X_C": 0}
+
+    # --- URL FILTER ---
+    url_matches = URL_PATTERN.findall(text)
+    url_count = len(url_matches)
+    url_char_ratio = sum(len(u) for u in url_matches) / max(len(text), 1)
+
+    if url_count > URL_COUNT_MAX or url_char_ratio > URL_CHAR_RATIO_MAX:
+        # Key must match the normal return path below, or callers reading
+        # features_passed silently get nothing for URL-filtered chunks.
+        return {"total_score": 0.0, "features_passed": features, "metrics": {"url_filtered": True}}
+
+    # 1. X_T (Token Count)
+    token_count = len(tokenizer.encode(text))
+    if TOKEN_MIN <= token_count <= TOKEN_MAX:
+        features["X_T"] = 1
+        score += (1 * W_TOKENS)
+
+    # 2. X_P (Refined Punctuation)
+    clean_text = text.rstrip()
+    starts_mid = bool(clean_text) and clean_text[0].islower()
+    ends_good = clean_text[-1] in GOOD_END if clean_text else False
+    ends_weak = clean_text[-1] in WEAK_END if clean_text else False
+
+    if ends_good and not starts_mid:
+        features["X_P"] = 1
+        score += (1 * W_PUNC)
+    elif ends_weak or (ends_good and starts_mid):
+        features["X_P"] = 0.5
+        score += (0.5 * W_PUNC)
+
+    # 3. X_E (Content Richness)
+    content_richness = _content_richness(text)
+    if content_richness >= 0.45:
+        features["X_E"] = 1
+        score += (1 * W_ENTITIES)
+
+    # 4. X_C (Refined Overlap) — uses Ollama BGE via lazy loader
+    overlap_sim = 0.0
+    if previous_chunk is None or not _same_section(previous_chunk, current_chunk):
+        features["X_C"] = 1
+        score += (1 * W_OVERLAP)
+    else:
+        embedder = _get_embedder()
+        vecs = embedder.embed_documents([previous_chunk.page_content, text])
+        overlap_sim = _cosine_sim(vecs[0], vecs[1])
+
+        if 0.05 <= overlap_sim <= 0.95:
+            features["X_C"] = 1
+            score += (1 * W_OVERLAP)
+
+    return {
+        "total_score": round(float(score), 2),
+        "features_passed": features,
+        "metrics": {
+            "token_count": token_count,
+            "content_richness": round(float(content_richness), 3),
+            "overlap_similarity": round(overlap_sim, 3)
+        }
     }
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(f"{ollama_url}/api/generate", json=payload)
-        resp.raise_for_status()
-    data = resp.json()
-    return data.get("response", "").strip() if isinstance(data, dict) else str(data)
 
 
-def run_rag_chat():
-    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    model = os.getenv("OLLAMA_GENERATOR_MODEL", "qwen3:8b")
+# ─────────────────────────────────────────────────────────────────────
+# QUALITY GATE EXECUTION
+# ─────────────────────────────────────────────────────────────────────
+def apply_quality_gate(chunks: list[Document], threshold_score: float = 4.0):
+    processed_chunks = []
+    passed_count = 0
 
-    vectorstore, bm25, chunks = load_indices()
-    print(f"\n✅ RAG SYSTEM READY ({len(chunks)} chunks indexed)")
-    print(f"   Model     : {model}")
-    print(f"   Top-N     : {TOP_N}")
-    print(f"   Ollama    : {ollama_url}")
-    print("   Type 'exit' to quit.\n")
+    print(f"\n{'═'*60}\n RUNNING REFINED QUALITY GATE (Threshold: {threshold_score}/{MAX_SCORE})\n{'═'*60}")
 
-    while True:
-        query = input("👤 Question: ").strip()
-        if not query:
-            continue
-        if query.lower() in {"exit", "quit"}:
-            break
+    previous_chunk = None
+    for chunk in chunks:
+        evaluation = evaluate_chunk_refined(chunk, previous_chunk)
 
-        t0 = time.perf_counter()
-        results = hybrid_retrieve(query, vectorstore, bm25, chunks, top_n=TOP_N)
-        retrieval_ms = (time.perf_counter() - t0) * 1000
+        chunk.metadata["strict_score"] = evaluation["total_score"]
+        chunk.metadata["passed_gate"] = evaluation["total_score"] >= threshold_score
+        chunk.metadata["gate_metrics"] = evaluation.get("metrics", {})
 
-        if not results:
-            print("⚠️  No relevant chunks found.\n")
-            continue
+        if chunk.metadata["passed_gate"]:
+            passed_count += 1
 
-        expanded = expand_with_neighbors_scored(results=results, chunks=chunks, window=1)
+        processed_chunks.append(chunk)
+        previous_chunk = chunk
 
-        context_parts = []
-        for doc, score in expanded:
-            source = doc.metadata.get("source", "unknown")
-            page = doc.metadata.get("page", "?")
-            context_parts.append(
-                f"[Source: {source} | Page: {page} | Score: {score:.3f}]\n"
-                f"{doc.page_content}"
-            )
-        context_blob = "\n\n---\n\n".join(context_parts)
+    print(f"Total Chunks Processed : {len(chunks)}")
+    print(f"Passed (Status: True)  : {passed_count} chunks")
+    print(f"Dropped (Status: False): {len(chunks) - passed_count} chunks")
+    return processed_chunks
 
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\n"
-            f"CONTEXT:\n{context_blob}\n\n"
-            f"QUESTION: {query}\n\n"
-            f"ANSWER (use ONLY the context above):"
-        )
 
-        t1 = time.perf_counter()
-        print(f"\n🤖 Generating... (retrieval: {retrieval_ms:.0f}ms)", flush=True)
-        answer = generate_answer(prompt, model=model, ollama_url=ollama_url)
-        generation_ms = (time.perf_counter() - t1) * 1000
-        total_ms = retrieval_ms + generation_ms
+def load_chunks_jsonl(path: str) -> list[Document]:
+    chunks = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            record = json.loads(line)
+            chunks.append(Document(
+                page_content=record["page_content"],
+                metadata=record["metadata"]
+            ))
+    return chunks
 
-        print(f"\n📝 ANSWER:\n{answer}")
-        print(f"\n⏱  retrieval={retrieval_ms:.0f}ms  generation={generation_ms:.0f}ms  total={total_ms:.0f}ms\n")
+
+def save_chunks_jsonl(chunks: list[Document], output_path: str) -> None:
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for chunk in chunks:
+            f.write(json.dumps({
+                "page_content": chunk.page_content,
+                "metadata": chunk.metadata
+            }, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
-    run_rag_chat()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", default="data/chunks/chunks.jsonl")
+    parser.add_argument("--output", default="data/chunks/chunks_processed.jsonl")
+    parser.add_argument("--threshold", type=float, default=4.0)
+    args = parser.parse_args()
+
+    all_chunks = load_chunks_jsonl(args.input)
+    processed = apply_quality_gate(all_chunks, threshold_score=args.threshold)
+    save_chunks_jsonl(processed, args.output)
+    print(f"Saved ALL chunks to {args.output}")

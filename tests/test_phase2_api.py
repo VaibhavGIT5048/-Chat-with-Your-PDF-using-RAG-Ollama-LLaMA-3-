@@ -8,14 +8,14 @@ from APP.schemas import HealthStatus, QueryResponse, SourceChunk
 
 class FakeService:
     def health(self):
-        return HealthStatus(status="ok", service="rag-api", qdrant="up", ollama="up", collection_name="chunks_collection")
+        return HealthStatus(status="ok", service="rag-api", qdrant="up", openai="up", collection_name="chunks_collection")
 
     def answer(self, request):
         return QueryResponse(
             request_id="stub",
             answer="stub answer",
             sources=[SourceChunk(chunk_id=1, source="demo.pdf", page=1, score=0.99, content="demo chunk")],
-            model="qwen3:8b",
+            model="gpt-4o-mini",
             collection_name="chunks_collection",
         )
 
@@ -36,7 +36,7 @@ class Phase2ApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["answer"], "stub answer")
-        self.assertEqual(payload["model"], "qwen3:8b")
+        self.assertEqual(payload["model"], "gpt-4o-mini")
         self.assertEqual(len(payload["sources"]), 1)
 
 

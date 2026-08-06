@@ -1,0 +1,34 @@
+# syntax=docker/dockerfile:1
+
+# Stage 1: Builder
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# The UI only talks to the API over HTTP — it never needs langchain/qdrant/torch,
+# so it gets its own minimal requirements file instead of the full backend stack.
+COPY requirements-ui.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements-ui.txt
+
+# Stage 2: Runtime
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+RUN useradd --create-home appuser
+USER appuser
+WORKDIR /home/appuser/app
+
+COPY --chown=appuser:appuser APP/app.py ./app.py
+
+EXPOSE 8501
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=3)" || exit 1
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]

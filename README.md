@@ -1,20 +1,20 @@
 <div align="center">
 
 <h1>📘 Chat with Your PDF</h1>
-<h3>A Privacy-First, Self-Hosted RAG System with Semantic Edge</h3>
+<h3>A Self-Hosted RAG System with Semantic Retrieval, Powered by OpenAI</h3>
 
 <p>
   <img src="https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white"/>
   <img src="https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white"/>
   <img src="https://img.shields.io/badge/FastAPI-Backend-009688?style=for-the-badge&logo=fastapi&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Streamlit-UI-red?style=for-the-badge&logo=streamlit&logoColor=white"/>
-  <img src="https://img.shields.io/badge/Ollama-Qwen3%208B-orange?style=for-the-badge"/>
+       <img src="https://img.shields.io/badge/Next.js-Frontend-black?style=for-the-badge&logo=nextdotjs&logoColor=white"/>
+  <img src="https://img.shields.io/badge/OpenAI-GPT--4o--mini-412991?style=for-the-badge&logo=openai&logoColor=white"/>
   <img src="https://img.shields.io/badge/Qdrant-Vector%20Store-purple?style=for-the-badge"/>
   <img src="https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge"/>
 </p>
 
 <p>
-  <b>Upload a PDF. Ask document-grounded questions. Get local, private answers with semantic chunking, Qdrant vector store, and Qwen3.</b>
+  <b>Upload a PDF. Ask document-grounded questions. Get cited answers via semantic chunking, hybrid Qdrant + BM25 retrieval, and OpenAI generation.</b>
 </p>
 
 <br/>
@@ -25,13 +25,13 @@
 
 ## 🌟 Project Philosophy
 
-This is a **privacy-first, self-hosted RAG system** distributed as an open source tool.
+This is a **self-hosted RAG orchestration layer** distributed as an open source tool.
 
-- 🔒 **Zero data leaves the user's machine**
-- 💻 **Works on any reasonable developer hardware**
+- 🐳 **Fully containerized** — UI, API, and vector store all start with one `docker compose up`
+- 🔑 **Bring your own OpenAI key** — generation and embeddings run on OpenAI's API; nothing else leaves your machine
 - ⚡ **One-command startup after initial setup**
-- 🏭 **Every local component has a direct production equivalent**
-- ☁️ **No cloud dependency for inference, ever**
+- 🏭 **Every component has a direct production equivalent**
+- 🧠 **Self-hosted retrieval** — Qdrant, BM25, and reranking run entirely inside your own Docker network
 
 ---
 
@@ -39,36 +39,33 @@ This is a **privacy-first, self-hosted RAG system** distributed as an open sourc
 
 ```mermaid
 flowchart TD
-    subgraph "Native Layer (Host)"
-        O[Ollama]
-        Q[qwen3 Qwen3 Generation]
-        N[qllama/bge-small-en-v1.5:latest Embeddings]
-        O --- Q
-        O --- N
-    end
-
     subgraph "Docker Compose Layer"
-        UI[Streamlit UI
-Port 8501 Exposed]
+       UI[Next.js Frontend
+Port 3000 Exposed]
         API[FastAPI Backend
 Port 8000 Internal]
         R[Flashrank Reranker]
         DB[(Qdrant Vector DB
 Port 6333 Internal)]
-        
+
         UI -->|REST| API
         API -->|Semantic Chunking| API
         API --- R
         API -->|Connects| DB
     end
 
-    API -.->|host.docker.internal| O
+    subgraph "External"
+        OAI[OpenAI API
+Chat + Embeddings]
+    end
+
+    API -->|HTTPS| OAI
 ```
 
 ### Components Isolation
-- **Streamlit (`localhost:8501`)**: The *only* visible interface.
+- **Next.js frontend (`localhost:3000`)**: The *only* visible interface — now also containerized.
 - **FastAPI / Qdrant**: Securely locked inside the Docker network.
-- **Ollama**: Exclusively runs natively on Mac/Windows for maximum GPU passthrough (M-Series Metal/CUDA).
+- **OpenAI**: The only external dependency — reached over HTTPS for chat completions and embeddings.
 
 ---
 
@@ -76,15 +73,15 @@ Port 6333 Internal)]
 
 | Layer | Technology | Details |
 |---|---|---|
-| **Frontend UI** | Streamlit | Clean UI handling PDF uploads and chat. |
+| **Frontend UI** | Next.js + React | Clean UI handling PDF uploads and chat; containerized. |
 | **Backend API** | FastAPI + Uvicorn | Dedicated async API orchestration layer separating UI from mechanics. |
 | **Orchestration** | LangChain | Framework tying retrieval + generation. |
-| **Vector Database** | Qdrant | Concurrent-safe, dockerized, persistent volume, replacing FAISS. |
-| **Embeddings** | `qllama/bge-small-en-v1.5:latest` | 384-dimensional embeddings served via native Ollama. |
+| **Vector Database** | Qdrant | Concurrent-safe, dockerized, persistent volume. |
+| **Embeddings** | OpenAI `text-embedding-3-small` | 1536-dimensional embeddings via the OpenAI API, batched with parallel requests. |
 | **Chunking** | Semantic Chunking | Breaks by conceptual boundaries instead of naive physical characters. |
 | **Sparse Retrieval** | BM25 | Pure keyword lookups for specific nouns and names. |
 | **Reranker** | Flashrank | Fast ONNX CPU reranking to filter top 20 fused candidates to the top 5. |
-| **Generation Model** | Qwen3 8B | Via Ollama (Thinking Mode disabled to ensure pure grounded RAG generation). |
+| **Generation Model** | OpenAI `gpt-4o-mini` | Configurable via `OPENAI_CHAT_MODEL`. |
 
 ---
 
@@ -97,7 +94,7 @@ Semantic Chunking (respecting meaning, not max length)
        ↓
 Chunk Quality Gate
        ↓
-qllama/bge-small-en-v1.5:latest → Qdrant (Dense Index)   +   BM25 (Sparse Index)
+OpenAI Embeddings → Qdrant (Dense Index)   +   BM25 (Sparse Index)
        ↓
 Reciprocal Rank Fusion (RRF) -> Top 20
        ↓
@@ -105,43 +102,45 @@ Flashrank Reranker -> Top 5
        ↓
 Neighbor Context Expansion
        ↓
-Qwen3 8B (via Ollama) -> Final Grounded Answer
+OpenAI Chat Completion -> Final Grounded Answer
 ```
 
 ---
 
-## 💻 Hardware Tiers & Supported Modes
+## 📁 Project Structure
 
-The system requires simple `.env` flag configurations to match your machine power: `MODEL_TIER=performance` or `MODEL_TIER=lite`.
+```text
+APP/                     Application code (FastAPI service, RAG pipeline, evaluation)
+docker/                  Dockerfiles for the api and ui services
+data/                    All generated/runtime artifacts (gitignored)
+  chunks/                Chunked documents (raw + quality-gated JSONL)
+  indexes/               BM25 index
+  evals/                 RAGAS datasets, generation cache, experiment results
+  flashrank_cache/       Downloaded reranker model (persisted across restarts)
+  qdrant_storage/        Qdrant's own persistent storage
+tests/                   Unit tests
+scripts/                 Smoke-test / one-off scripts
+```
 
-| Hardware | Mode | Generation Model | Embedding Model |
-|---|---|---|---|
-| Mac M1/M2/M3/M4 (16GB+) | `performance` | Qwen3 8B | `qllama/bge-small-en-v1.5:latest` |
-| Mac M1/M2/M3/M4 (8GB) | `lite` | Qwen3 1.7B | `qllama/bge-small-en-v1.5:latest` |
-| Windows/Linux (GPU 8GB+) | `performance` | Qwen3 8B | `qllama/bge-small-en-v1.5:latest` |
-| Windows/Linux (CPU 16GB) | `lite` | Qwen3 1.7B | `qllama/bge-small-en-v1.5:latest` |
-| Below 8GB RAM | *Not Supported* | — | — |
+---
+
+## 💻 Requirements
+
+- [Docker Desktop](https://www.docker.com/) (or Docker Engine + Compose)
+- An [OpenAI API key](https://platform.openai.com/api-keys)
+
+No GPU and no local model downloads are required — generation and embeddings run on OpenAI's API.
 
 ---
 
 ## ⚙️ Setup & Deployment Flow
 
-Get your private RAG interface running in **under 15 minutes**:
+Get your RAG interface running in **under 5 minutes**:
 
-### Step 1: Install Ollama (Native)
-Download and install [Ollama](https://ollama.com/) naturally for your OS (Do not containerize).
-```bash
-ollama pull qllama/bge-small-en-v1.5:latest
-ollama pull qwen3:8b
-ollama pull qwen3:1.7b
-```
-
-*(Optional: Set `OLLAMA_NUM_PARALLEL=2` to allow concurrent embedding + generation)*
-
-### Step 2: Install Docker
+### Step 1: Install Docker
 Make sure [Docker Desktop](https://www.docker.com/) is installed and running.
 
-### Step 3: Clone & Configure
+### Step 2: Clone & Configure
 ```bash
 git clone https://github.com/VaibhavGIT5048/Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama.git
 cd Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama
@@ -149,29 +148,27 @@ cd Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama
 # Copy environment config
 cp .env.example .env
 ```
-Ensure your `.env` contains `MODEL_TIER=performance` (or lite).
+Edit `.env` and set `OPENAI_API_KEY=sk-...` (the other variables have sane defaults).
 
-### Step 4: Launch via Docker Compose
+### Step 3: Launch via Docker Compose
 ```bash
 docker compose up
 ```
 
-Open your browser to `http://localhost:8501` to start chatting!
-
-*(⚠️ Note to Linux users: Docker handles Mac/Win `host.docker.internal` cleanly. Under Linux, we enforce `host-gateway` bridge in Docker compose so behaviors remain equivalent.)*
+Open your browser to `http://localhost:3000` to start chatting!
 
 ---
 
 ## 📊 Evaluation & Diagnostics
 
-The evaluation stack leverages the **RAGAS** framework, powered by **Qwen3 1.7B** for fast judge processing. 
+The evaluation stack leverages the **RAGAS** framework, with OpenAI (`gpt-4o-mini` by default) as both the generation "student" and the judge.
 
 ### Metrics Validated:
 - **Retrieval Metrics**: Recall@K, MRR, NDCG, Hit Rate
 - **Generation Metrics**: Faithfulness, Context Precision, Answer Relevance
 - **Diagnostics**: Independent robust OOD Evaluation endpoints.
 
-*Because retrieval metrics run entirely independent of generation, evaluation is remarkably fast without exhausting GPU bottlenecks.*
+*Because retrieval metrics run entirely independent of generation, evaluation stays fast even as dataset size grows.*
 
 ---
 
@@ -181,14 +178,14 @@ The evaluation stack leverages the **RAGAS** framework, powered by **Qwen3 1.7B*
 git pull
 docker compose up --build
 ```
-Two commands rebuild only changed layers — perfectly caching unaltered components. If fundamental embedding dimensions or chunking strategies shift across major updates, internal migration loops trigger safely on startup.
+Two commands rebuild only changed layers — pip's download cache (via BuildKit) and Docker's layer cache keep rebuilds fast. Changing the embedding model dimension requires re-ingesting your documents, since existing Qdrant vectors won't match the new size.
 
 ---
 
 ## 📄 License & Privacy
 
 This project is licensed under the **MIT License**.
-*Zero telemetry natively. Your data never touches a public cloud.*
+*Retrieval, storage, and orchestration are fully self-hosted in your own Docker network. Document text and questions are sent to OpenAI's API for embeddings and generation — no other third-party telemetry.*
 
 ---
 
@@ -207,5 +204,5 @@ President @ Data Dynamos | Hackathon Builder | ML Researcher
 ---
 
 <div align="center">
-  <sub>Built with Streamlit, FastAPI, Docker, Qdrant, Ollama & Qwen3.</sub>
+       <sub>Built with Next.js, FastAPI, Docker, Qdrant & OpenAI.</sub>
 </div>

@@ -4,20 +4,22 @@ import numpy as np
 
 from langchain_core.documents import Document
 
-from langchain_ollama import OllamaEmbeddings
+from langchain_openai import OpenAIEmbeddings
+
+DEFAULT_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
 
 class EmbeddingAdapter:
-    def __init__(self, model_name: str = "qllama/bge-small-en-v1.5:latest", base_url: str | None = None):
+    def __init__(self, model_name: str = DEFAULT_EMBEDDING_MODEL, api_key: str | None = None):
         self.model_name = model_name
-        self.base_url = base_url or os.getenv("OLLAMA_URL", "http://localhost:11434")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self._backend = None
 
     def _load_backend(self):
         if self._backend is not None:
             return self._backend
 
-        self._backend = OllamaEmbeddings(model=self.model_name, base_url=self.base_url)
+        self._backend = OpenAIEmbeddings(model=self.model_name, api_key=self.api_key)
         return self._backend
 
     def embed_documents(self, texts: list[str]):
@@ -48,7 +50,7 @@ def load_filtered_chunks(input_path: str, passed_only: bool = False) -> list[Doc
     return passed_chunks
 
 
-def load_embedding_model(model_name: str = "qllama/bge-small-en-v1.5:latest"):
+def load_embedding_model(model_name: str = DEFAULT_EMBEDDING_MODEL):
     print(f"🔄 Loading embedding adapter: {model_name}...")
     embedding_model = EmbeddingAdapter(model_name=model_name)
     print(f"✅ Embedding adapter ready (primary: {model_name})")
@@ -65,7 +67,7 @@ def generate_embeddings(chunks, model):
 
 
 if __name__ == "__main__":
-    INPUT_FILE = "chunks/chunks_processed.jsonl"
+    INPUT_FILE = "data/chunks/chunks_processed.jsonl"
 
     high_quality_chunks = load_filtered_chunks(INPUT_FILE)
 

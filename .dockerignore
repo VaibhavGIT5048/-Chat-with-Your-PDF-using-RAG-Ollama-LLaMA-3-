@@ -1,0 +1,32 @@
+# Local environments — never needed in the build context
+.venv/
+.venv*/
+venv/
+__pycache__/
+**/__pycache__/
+**/*.pyc
+
+# VCS / IDE
+.git/
+.gitignore
+.vscode/
+.streamlit/
+.DS_Store
+
+# Secrets and local config — supplied at runtime via env_file, not baked into the image
+.env
+.env.docker
+.env.example
+
+# Runtime data — mounted as volumes, not part of the image
+data/
+
+# Tests, scripts, docs — not needed to run the API/UI
+tests/
+scripts/
+README.md
+*.md
+
+# Compose/build files themselves don't need to be inside the image
+docker-compose.yml
+docker/

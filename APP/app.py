@@ -14,8 +14,10 @@ API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 
 def api_health() -> bool:
+    # /health probes Qdrant + OpenAI, so it can take a few seconds on a cold cache.
+    # A short timeout here reports a healthy backend as unreachable.
     try:
-        resp = requests.get(f"{API_URL}/health", timeout=3)
+        resp = requests.get(f"{API_URL}/health", timeout=15)
         return resp.status_code == 200
     except (ConnectionError, requests.Timeout):
         return False
@@ -29,7 +31,9 @@ def api_ingest(filename: str, file_bytes: bytes, chunk_size: int, chunk_overlap:
         "quality_threshold": quality_threshold,
     }
     started = perf_counter()
-    resp = requests.post(f"{API_URL}/ingest", files=files, data=data, timeout=120)
+    # Semantic chunking issues one embedding call per split, so a full-size PDF
+    # can legitimately take minutes.
+    resp = requests.post(f"{API_URL}/ingest", files=files, data=data, timeout=600)
     latency_ms = round((perf_counter() - started) * 1000, 2)
     resp.raise_for_status()
     return resp.json(), latency_ms
@@ -77,17 +81,18 @@ def main() -> None:
         top_k = st.slider("Retrieved chunks", 1, 8, 4)
         auto_clear = st.checkbox("Clear chat after ingest", value=True)
 
-    uploaded_files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
-    ingest_requested = st.button("Ingest PDFs", type="primary", disabled=not uploaded_files)
+    # Single file only: /ingest recreates the vector collection, so ingesting a second
+    # document would silently discard the first. One document per index.
+    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"], accept_multiple_files=False)
+    ingest_requested = st.button("Ingest PDF", type="primary", disabled=not uploaded_file)
 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
     if "pipeline_stats" not in st.session_state:
         st.session_state.pipeline_stats = None
 
-    if ingest_requested and uploaded_files:
-        for uploaded_file in uploaded_files:
-            st.write(f"Ingesting `{uploaded_file.name}`")
+    if ingest_requested and uploaded_file:
+        with st.spinner(f"Ingesting `{uploaded_file.name}` — this can take a few minutes..."):
             try:
                 result, ingest_latency_ms = api_ingest(
                     filename=uploaded_file.name,
@@ -103,9 +108,9 @@ def main() -> None:
                 st.error(f"API connection failed during ingest: {exc}")
                 st.stop()
 
-            st.session_state.pipeline_stats = result
-            st.metric("Ingest latency", f"{ingest_latency_ms} ms")
-            st.json(result)
+        st.session_state.pipeline_stats = result
+        st.metric("Ingest latency", f"{ingest_latency_ms} ms")
+        st.json(result)
 
         if auto_clear:
             st.session_state.chat_history = []
@@ -118,7 +123,7 @@ def main() -> None:
             f"Indexed: {stats.get('indexed_chunks')}"
         )
 
-    if uploaded_files is None:
+    if uploaded_file is None and not st.session_state.pipeline_stats:
         st.warning("Upload and ingest a PDF to start querying.")
         return
 

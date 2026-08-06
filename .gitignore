@@ -8,9 +8,5 @@ __pycache__/
 **/__pycache__/
 **/*.pyc
 .vscode/
-chunks/
-indexes/
-evals/
-evaluation/
 data/
 *.pdf

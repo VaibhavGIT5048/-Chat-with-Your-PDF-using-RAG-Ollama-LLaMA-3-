@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import asyncio
 import hashlib
@@ -12,7 +15,6 @@ import sys
 import time
 from pathlib import Path
 
-import httpx
 import pandas as pd
 from qdrant_client import QdrantClient
 
@@ -41,84 +43,52 @@ from ragas.metrics import (
 )
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
-from langchain_community.chat_models import ChatOllama
-from langchain_community.embeddings import OllamaEmbeddings
+
+# OpenAI — generation, OOD judge, dataset gen, AND RAGAS judging
+from openai import AsyncOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 # ─────────────────────────────────────────────────────────────────────
 # 1. CONFIG
 # ─────────────────────────────────────────────────────────────────────
-OLLAMA_URL        = os.getenv("OLLAMA_URL", "http://localhost:11434")
-JUDGE_MODEL       = os.getenv("OLLAMA_JUDGE_MODEL", "llama3.1:8b")
-GENERATOR_MODEL   = os.getenv("OLLAMA_GENERATOR_MODEL", "qwen3:8b")
-REQUESTED_EMBEDDING_MODEL = os.getenv(
-    "EMBEDDING_MODEL",
-    os.getenv("OLLAMA_EMBEDDING_MODEL", "qllama/bge-small-en-v1.5:latest"),
-)
-EVAL_CONCURRENCY  = int(os.getenv("EVAL_CONCURRENCY", "2"))
-GEN_CONCURRENCY   = int(os.getenv("GEN_CONCURRENCY", "2"))
+OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
+GENERATOR_MODEL     = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+OPENAI_JUDGE_MODEL  = os.getenv("OPENAI_JUDGE_MODEL", "gpt-4o-mini")
+EMBEDDING_MODEL     = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+EVAL_CONCURRENCY   = int(os.getenv("EVAL_CONCURRENCY", "2"))
+GEN_CONCURRENCY    = int(os.getenv("GEN_CONCURRENCY", "2"))
 
-print("🚀 RAG Evaluation Engine (RAGAS-backed)")
-print(f"   Judge      : {JUDGE_MODEL}")
-print(f"   Generator  : {GENERATOR_MODEL}")
-print(f"   Ollama     : {OLLAMA_URL}")
-
-
-def resolve_embedding_model(preferred: str) -> str:
-    candidates = [preferred, "qllama/bge-small-en-v1.5:latest", "qllama/bge-small-en-v1.5", "bge-small-en-v1.5"]
-
-    def normalize(name: str) -> str:
-        return name[:-7] if name.endswith(":latest") else name
-
-    try:
-        with httpx.Client(timeout=5.0) as client:
-            resp = client.get(f"{OLLAMA_URL}/api/tags")
-            resp.raise_for_status()
-        payload = resp.json()
-        models = payload.get("models", []) if isinstance(payload, dict) else []
-        available = {
-            normalize(item.get("model") or item.get("name") or "")
-            for item in models
-            if isinstance(item, dict)
-        }
-        for candidate in candidates:
-            if candidate in available or normalize(candidate) in available:
-                return candidate
-    except Exception:
-        pass
-    return preferred
-
-
-EMBEDDING_MODEL = resolve_embedding_model(REQUESTED_EMBEDDING_MODEL)
-if EMBEDDING_MODEL != REQUESTED_EMBEDDING_MODEL:
-    print(f"   Embedding fallback: {REQUESTED_EMBEDDING_MODEL} -> {EMBEDDING_MODEL}")
-else:
-    print(f"   Embedding model: {EMBEDDING_MODEL}")
-
-if JUDGE_MODEL == GENERATOR_MODEL:
-    print(
-        f"⚠️  WARNING: JUDGE_MODEL == GENERATOR_MODEL ('{JUDGE_MODEL}'). "
-        "Self-judging inflates faithfulness scores. "
-        "Set OLLAMA_JUDGE_MODEL=llama3.1:8b in .env"
+if not OPENAI_API_KEY:
+    raise EnvironmentError(
+        "OPENAI_API_KEY is not set. "
+        "Add it to your .env file: OPENAI_API_KEY=sk-proj-..."
     )
 
+_async_openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+print("🚀 RAG Evaluation Engine (RAGAS-backed, OpenAI end-to-end)")
+print(f"   Generator  : {GENERATOR_MODEL}")
+print(f"   OOD Judge  : {OPENAI_JUDGE_MODEL}")
+print(f"   RAGAS Judge: {OPENAI_JUDGE_MODEL}")
+print(f"   Embeddings : {EMBEDDING_MODEL}")
+
 # ─────────────────────────────────────────────────────────────────────
-# 2. OLLAMA HELPER (used for generation + OOD judge + dataset gen)
+# 2. OPENAI HELPER (generation + OOD judge + dataset gen)
 # ─────────────────────────────────────────────────────────────────────
 
-async def ollama_generate(prompt: str, model: str, temperature: float = 0.0, max_tokens: int = 700) -> str:
-    """Call Ollama /api/generate and return the response string."""
-    payload = {
-        "model": model,
-        "think": False,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": temperature, "num_predict": max_tokens},
-    }
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        resp.raise_for_status()
-    data = resp.json()
-    return data.get("response", "") if isinstance(data, dict) else str(data)
+async def openai_generate(
+    prompt: str,
+    model: str,
+    temperature: float = 0.0,
+    max_tokens: int = 700,
+) -> str:
+    response = await _async_openai_client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.choices[0].message.content or ""
 
 
 def extract_json(text: str) -> dict | None:
@@ -136,10 +106,10 @@ def extract_json(text: str) -> dict | None:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 2b. GENERATION CACHE — skip regeneration on rerun
+# 2b. GENERATION CACHE
 # ─────────────────────────────────────────────────────────────────────
 
-GEN_CACHE_PATH = Path("evals/cache/generations.jsonl")
+GEN_CACHE_PATH = Path("data/evals/cache/generations.jsonl")
 _GEN_CACHE: dict[str, str] = {}
 
 
@@ -172,14 +142,14 @@ async def cached_generate(prompt: str, model: str) -> str:
     key = _gen_cache_key(model, prompt)
     if key in _GEN_CACHE:
         return _GEN_CACHE[key]
-    answer = await ollama_generate(prompt, model=model, temperature=0.0, max_tokens=512)
+    answer = await openai_generate(prompt, model=model, temperature=0.0, max_tokens=512)
     _GEN_CACHE[key] = answer
     _append_gen_cache(key, answer)
     return answer
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 3. OOD JUDGE (kept — RAGAS has no "correct refusal" classifier)
+# 3. OOD JUDGE — OpenAI
 # ─────────────────────────────────────────────────────────────────────
 
 OOD_JUDGE_PROMPT_TEMPLATE = """\
@@ -210,14 +180,18 @@ Rules:
 """
 
 
-async def judge_ood(question: str, answer: str, contexts: list[str]) -> tuple[dict | None, str]:
+async def judge_ood(
+    question: str,
+    answer: str,
+    contexts: list[str],
+) -> tuple[dict | None, str]:
     context_blob = "\n\n".join(contexts)
     prompt = OOD_JUDGE_PROMPT_TEMPLATE.format(
         context=context_blob,
         question=question,
         answer=answer,
     )
-    raw = await ollama_generate(prompt, model=JUDGE_MODEL, temperature=0, max_tokens=300)
+    raw = await openai_generate(prompt, model=OPENAI_JUDGE_MODEL, temperature=0, max_tokens=300)
     payload = extract_json(raw)
     return payload, raw
 
@@ -273,7 +247,9 @@ async def _gen_qa(chunk: dict, q_type: int, gen_sem: asyncio.Semaphore) -> dict 
     async with gen_sem:
         template = QA_TEMPLATES[q_type % len(QA_TEMPLATES)]
         prompt = template.format(context=chunk["page_content"][:1200])
-        raw = await ollama_generate(prompt, model=GENERATOR_MODEL, temperature=0.2, max_tokens=250)
+        raw = await openai_generate(
+            prompt, model=GENERATOR_MODEL, temperature=0.2, max_tokens=250
+        )
         payload = extract_json(raw)
         if not payload or not payload.get("question") or not payload.get("ground_truth"):
             return None
@@ -288,7 +264,9 @@ async def _gen_qa(chunk: dict, q_type: int, gen_sem: asyncio.Semaphore) -> dict 
 async def _gen_ood(chunk: dict, gen_sem: asyncio.Semaphore) -> dict | None:
     async with gen_sem:
         prompt = OOD_TEMPLATE.format(context=chunk["page_content"][:800])
-        raw = await ollama_generate(prompt, model=GENERATOR_MODEL, temperature=0.4, max_tokens=250)
+        raw = await openai_generate(
+            prompt, model=GENERATOR_MODEL, temperature=0.4, max_tokens=250
+        )
         payload = extract_json(raw)
         if not payload or not payload.get("question"):
             return None
@@ -300,7 +278,12 @@ async def _gen_ood(chunk: dict, gen_sem: asyncio.Semaphore) -> dict | None:
         }
 
 
-async def build_dataset(chunks_path: str, num_questions: int, seed: int, ood_ratio: float) -> list[dict]:
+async def build_dataset(
+    chunks_path: str,
+    num_questions: int,
+    seed: int,
+    ood_ratio: float,
+) -> list[dict]:
     chunks = load_chunks_jsonl(chunks_path)
     if not chunks:
         raise ValueError(f"No chunks found in {chunks_path}")
@@ -321,21 +304,22 @@ async def build_dataset(chunks_path: str, num_questions: int, seed: int, ood_rat
 
     dataset = [r for r in in_results if r] + [r for r in ood_results if r]
     random.shuffle(dataset)
-    print(f"✅ Dataset: {len(dataset)} questions "
-          f"({len([r for r in dataset if not r['ood']])} in-scope, "
-          f"{len([r for r in dataset if r['ood']])} OOD)")
+    print(
+        f"✅ Dataset: {len(dataset)} questions "
+        f"({len([r for r in dataset if not r['ood']])} in-scope, "
+        f"{len([r for r in dataset if r['ood']])} OOD)"
+    )
     return dataset
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 5. RAG STUDENT — uses production stack (Qdrant + BM25 + bge)
+# 5. RAG STUDENT
 # ─────────────────────────────────────────────────────────────────────
 
 def _load_production_indices():
-    """Load the same BM25 + Qdrant indices used in production."""
-    bm25_path = Path("indexes/bm25_data.pkl")
+    bm25_path = Path("data/indexes/bm25_data.pkl")
     if not bm25_path.exists():
-        raise FileNotFoundError("indexes/bm25_data.pkl not found. Run /ingest first.")
+        raise FileNotFoundError("data/indexes/bm25_data.pkl not found. Run /ingest first.")
 
     with open(bm25_path, "rb") as f:
         data = pickle.load(f)
@@ -367,11 +351,9 @@ async def get_rag_answer(
     )
     retrieval_ms = (time.time() - start) * 1000.0
 
-    # (A) same expanded context the production API uses, WITH scores
     expanded = expand_with_neighbors_scored(results=results, chunks=chunks, window=1)
     contexts = [doc.page_content for doc, _ in expanded]
 
-    # production-identical prompt (canonical SYSTEM_PROMPT, temperature=0)
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
         f"CONTEXT:\n{chr(10).join(contexts)}\n\n"
@@ -383,7 +365,7 @@ async def get_rag_answer(
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 6. CLASSIC METRICS (retrieval + lexical overlap — independent of judge)
+# 6. CLASSIC METRICS
 # ─────────────────────────────────────────────────────────────────────
 
 REFUSAL_PATTERN = re.compile(
@@ -421,7 +403,10 @@ def token_f1(pred: str, truth: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
-def retrieval_hit(gold_context: str | None, retrieved: list[str]) -> tuple[int | None, float | None]:
+def retrieval_hit(
+    gold_context: str | None,
+    retrieved: list[str],
+) -> tuple[int | None, float | None]:
     if not gold_context:
         return None, None
     gold_norm = normalize_text(gold_context)
@@ -432,7 +417,7 @@ def retrieval_hit(gold_context: str | None, retrieved: list[str]) -> tuple[int |
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 7. EVAL LOOP — Phase A: run RAG + collect raw rows (no LLM judge yet)
+# 7. EVAL LOOP
 # ─────────────────────────────────────────────────────────────────────
 
 eval_sem: asyncio.Semaphore
@@ -444,14 +429,14 @@ async def run_one(
     bm25,
     chunks: list,
 ) -> dict:
-    """Run retrieval + generation for one question. Judging happens later
-    (RAGAS batch for in-scope, judge_ood per-row for OOD)."""
     async with eval_sem:
         question = row["question"]
         gold_context = row.get("gold_context")
         ood = row.get("ood", False)
 
-        answer, contexts, retrieval_ms = await get_rag_answer(question, vectorstore, bm25, chunks)
+        answer, contexts, retrieval_ms = await get_rag_answer(
+            question, vectorstore, bm25, chunks
+        )
 
         refused = bool(REFUSAL_PATTERN.search(answer))
         hit_rank, mrr = retrieval_hit(gold_context, contexts)
@@ -460,22 +445,21 @@ async def run_one(
         f1 = token_f1(answer, row["ground_truth"]) if not ood else None
 
         return {
-            "question":      question,
-            "answer":        answer,
-            "contexts":      contexts,
-            "ground_truth":  row.get("ground_truth", ""),
-            "ood":           ood,
-            "refused":       refused,
-            "retrieval_ms":  round(retrieval_ms, 2),
-            "hit_rank":      hit_rank,
-            "mrr":           mrr,
-            "exact_match":   em,
-            "f1":            f1,
+            "question":     question,
+            "answer":       answer,
+            "contexts":     contexts,
+            "ground_truth": row.get("ground_truth", ""),
+            "ood":          ood,
+            "refused":      refused,
+            "retrieval_ms": round(retrieval_ms, 2),
+            "hit_rank":     hit_rank,
+            "mrr":          mrr,
+            "exact_match":  em,
+            "f1":           f1,
         }
 
 
 async def run_ood_judging(results: list[dict]) -> None:
-    """Mutates OOD rows in-place with judge_ood output."""
     ood_rows = [r for r in results if r["ood"]]
     tasks = [judge_ood(r["question"], r["answer"], r["contexts"]) for r in ood_rows]
     payloads = await asyncio.gather(*tasks)
@@ -487,9 +471,9 @@ async def run_ood_judging(results: list[dict]) -> None:
         ood_reason = ""
         if payload:
             correct_refusal = bool(payload.get("correct_refusal"))
-            hallucinated = bool(payload.get("hallucinated"))
-            irrelevant_ood = bool(payload.get("irrelevant"))
-            ood_reason = payload.get("reason", "")
+            hallucinated    = bool(payload.get("hallucinated"))
+            irrelevant_ood  = bool(payload.get("irrelevant"))
+            ood_reason      = payload.get("reason", "")
 
         if correct_refusal:
             verdict = "Correct Refusal"
@@ -498,44 +482,51 @@ async def run_ood_judging(results: list[dict]) -> None:
         else:
             verdict = "Irrelevant"
 
-        row["verdict"] = verdict
+        row["verdict"]             = verdict
         row["ood_correct_refusal"] = correct_refusal
-        row["ood_hallucinated"] = hallucinated
-        row["ood_irrelevant"] = irrelevant_ood
-        row["ood_reason"] = ood_reason
-        row["judge_raw"] = raw
-        # placeholders so the in-scope columns exist for all rows
-        row["faithfulness"] = None
-        row["answer_relevancy"] = None
-        row["context_precision"] = None
-        row["context_recall"] = None
+        row["ood_hallucinated"]    = hallucinated
+        row["ood_irrelevant"]      = irrelevant_ood
+        row["ood_reason"]          = ood_reason
+        row["judge_raw"]           = raw
+        row["faithfulness"]        = None
+        row["answer_relevancy"]    = None
+        row["context_precision"]   = None
+        row["context_recall"]      = None
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 8. RAGAS BATCH JUDGING — in-scope rows
+# 8. RAGAS BATCH JUDGING — OpenAI only
 # ─────────────────────────────────────────────────────────────────────
 
 def build_ragas_judge():
     judge_llm = LangchainLLMWrapper(
-        ChatOllama(model=JUDGE_MODEL, base_url=OLLAMA_URL, temperature=0, timeout=600)
+        ChatOpenAI(
+            model=OPENAI_JUDGE_MODEL,
+            api_key=OPENAI_API_KEY,
+            temperature=0,
+            timeout=60,
+            max_retries=2,
+        )
     )
     judge_embeddings = LangchainEmbeddingsWrapper(
-        OllamaEmbeddings(model=EMBEDDING_MODEL, base_url=OLLAMA_URL)
+        OpenAIEmbeddings(
+            model=EMBEDDING_MODEL,
+            api_key=OPENAI_API_KEY,
+        )
     )
     return judge_llm, judge_embeddings
 
 
 def run_ragas_judging(results: list[dict]) -> None:
-    """Mutates in-scope rows in-place with RAGAS scores + derived verdict."""
     in_rows = [r for r in results if not r["ood"]]
     if not in_rows:
         return
 
     ragas_dataset = Dataset.from_list([
         {
-            "question": r["question"],
-            "answer": r["answer"],
-            "contexts": r["contexts"],
+            "question":     r["question"],
+            "answer":       r["answer"],
+            "contexts":     r["contexts"],
             "ground_truth": r["ground_truth"],
         }
         for r in in_rows
@@ -543,41 +534,56 @@ def run_ragas_judging(results: list[dict]) -> None:
 
     judge_llm, judge_embeddings = build_ragas_judge()
 
-    print("\n⚖️  Running RAGAS metrics (faithfulness, answer_relevancy, "
-          "context_precision, context_recall)...")
-    ragas_result = evaluate(
-        ragas_dataset,
-        metrics=[
-            ragas_faithfulness,
-            ragas_answer_relevancy,
-            ragas_context_precision,
-            ragas_context_recall,
-        ],
-        llm=judge_llm,
-        embeddings=judge_embeddings,
-        run_config=RunConfig(timeout=600, max_workers=1, max_retries=2),
-        batch_size=1,
+    print(
+        f"\n⚖️  Running RAGAS metrics via OpenAI "
+        f"({OPENAI_JUDGE_MODEL}, 8 workers, batch=4)..."
     )
-    ragas_df = ragas_result.to_pandas()
+
+    try:
+        ragas_result = evaluate(
+            ragas_dataset,
+            metrics=[
+                ragas_faithfulness,
+                ragas_answer_relevancy,
+                ragas_context_precision,
+                ragas_context_recall,
+            ],
+            llm=judge_llm,
+            embeddings=judge_embeddings,
+            run_config=RunConfig(timeout=120, max_workers=8, max_retries=2),
+            batch_size=4,
+        )
+        ragas_df = ragas_result.to_pandas()
+    except Exception as e:
+        print(f"\n⚠️  RAGAS evaluation failed: {e}")
+        print("   Marking all in-scope rows as 'Unscored'")
+        for r in in_rows:
+            r["faithfulness"]        = None
+            r["answer_relevancy"]    = None
+            r["context_precision"]   = None
+            r["context_recall"]      = None
+            r["verdict"]             = "Unscored"
+            r["ood_correct_refusal"] = None
+            r["ood_hallucinated"]    = None
+            r["ood_irrelevant"]      = None
+            r["ood_reason"]          = ""
+            r["judge_raw"]           = ""
+        return
 
     for i, r in enumerate(in_rows):
         faithfulness_score = ragas_df.loc[i, "faithfulness"]
-        relevancy_score = ragas_df.loc[i, "answer_relevancy"]
-        precision_score = ragas_df.loc[i, "context_precision"]
-        recall_score = ragas_df.loc[i, "context_recall"]
+        relevancy_score    = ragas_df.loc[i, "answer_relevancy"]
+        precision_score    = ragas_df.loc[i, "context_precision"]
+        recall_score       = ragas_df.loc[i, "context_recall"]
 
-        r["faithfulness"] = faithfulness_score
-        r["answer_relevancy"] = relevancy_score
+        r["faithfulness"]      = faithfulness_score
+        r["answer_relevancy"]  = relevancy_score
         r["context_precision"] = precision_score
-        r["context_recall"] = recall_score
+        r["context_recall"]    = recall_score
 
-        # Verdict, with NaN-safe handling — a row the judge couldn't score
-        # is marked "Unscored", not silently treated as 0.0
         if pd.isna(faithfulness_score) or pd.isna(relevancy_score):
             verdict = "Unscored"
         elif r["refused"] and r["hit_rank"] is None:
-            # Model refused AND the gold context wasn't even retrieved —
-            # this is a correct refusal, not a hallucination/false refusal.
             verdict = "Correct Refusal"
         elif faithfulness_score < 0.5:
             verdict = "Hallucinated"
@@ -588,13 +594,12 @@ def run_ragas_judging(results: list[dict]) -> None:
         else:
             verdict = "Excellent"
 
-        r["verdict"] = verdict
-        # placeholders so the OOD columns exist for all rows
+        r["verdict"]             = verdict
         r["ood_correct_refusal"] = None
-        r["ood_hallucinated"] = None
-        r["ood_irrelevant"] = None
-        r["ood_reason"] = ""
-        r["judge_raw"] = ""
+        r["ood_hallucinated"]    = None
+        r["ood_irrelevant"]      = None
+        r["ood_reason"]          = ""
+        r["judge_raw"]           = ""
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -602,10 +607,10 @@ def run_ragas_judging(results: list[dict]) -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 def print_report(df: pd.DataFrame, elapsed: float) -> None:
-    df_in = df[df["ood"] == False]
+    df_in  = df[df["ood"] == False]
     df_ood = df[df["ood"] == True]
-    in_n = len(df_in)
-    ood_n = len(df_ood)
+    in_n   = len(df_in)
+    ood_n  = len(df_ood)
 
     def pct(series, val):
         return (series == val).sum() / max(len(series), 1) * 100
@@ -615,7 +620,8 @@ def print_report(df: pd.DataFrame, elapsed: float) -> None:
 
     print(f"\n{'═'*64}")
     print(f"🏁 EVALUATION COMPLETE  |  {elapsed:.1f}s total")
-    print(f"   Avg retrieval: {avg_r_ms:.1f}ms  |  P95: {p95_r_ms:.1f}ms")
+    print(f"   Avg retrieval : {avg_r_ms:.1f}ms  |  P95: {p95_r_ms:.1f}ms")
+    print(f"   RAGAS judge   : OpenAI {OPENAI_JUDGE_MODEL}")
     print(f"{'─'*64}")
     print(f"IN-SCOPE  (N={in_n})")
     if in_n:
@@ -629,7 +635,7 @@ def print_report(df: pd.DataFrame, elapsed: float) -> None:
         print(f"  {'Correct Refusal %':<26}: {pct(df_in['verdict'], 'Correct Refusal'):.1f}%")
         print(f"  {'Unscored %':<26}: {pct(df_in['verdict'], 'Unscored'):.1f}%")
         mrr_val = df_in["mrr"].dropna().mean()
-        f1_val = df_in["f1"].dropna().mean()
+        f1_val  = df_in["f1"].dropna().mean()
         print(f"  {'MRR':<26}: {mrr_val:.3f}")
         print(f"  {'Token F1':<26}: {f1_val:.3f}")
     print(f"{'─'*64}")
@@ -642,9 +648,9 @@ def print_report(df: pd.DataFrame, elapsed: float) -> None:
 
 
 def save_results(df: pd.DataFrame, elapsed: float) -> None:
-    Path("evals/experiments").mkdir(parents=True, exist_ok=True)
+    Path("data/evals/experiments").mkdir(parents=True, exist_ok=True)
 
-    df_in = df[df["ood"] == False]
+    df_in  = df[df["ood"] == False]
     df_ood = df[df["ood"] == True]
 
     def mean_numeric(series):
@@ -657,7 +663,8 @@ def save_results(df: pd.DataFrame, elapsed: float) -> None:
         "total_questions": len(df),
         "in_scope":        len(df_in),
         "ood":             len(df_ood),
-        "judge_model":     JUDGE_MODEL,
+        "judge_model":     OPENAI_JUDGE_MODEL,
+        "judge_backend":   "openai",
         "generator_model": GENERATOR_MODEL,
         "metrics": {
             "faithfulness":      mean_numeric(df_in["faithfulness"]) if len(df_in) else None,
@@ -673,22 +680,25 @@ def save_results(df: pd.DataFrame, elapsed: float) -> None:
         },
     }
 
-    results_path = "evals/results.json"
+    results_path = "data/evals/results.json"
     Path(results_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(results_path).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    Path(results_path).write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(f"📊 Results saved → {results_path}")
 
-    baseline_path = "evals/experiments/baseline_scores.json"
+    baseline_path = "data/evals/experiments/baseline_scores.json"
     if not Path(baseline_path).exists():
         Path(baseline_path).write_text(json.dumps(summary, indent=2), encoding="utf-8")
         print(f"📌 Baseline saved → {baseline_path}")
 
-    # contexts column is a list — stringify for CSV
     df_out = df.copy()
     if "contexts" in df_out.columns:
-        df_out["contexts"] = df_out["contexts"].apply(lambda c: json.dumps(c, ensure_ascii=False))
+        df_out["contexts"] = df_out["contexts"].apply(
+            lambda c: json.dumps(c, ensure_ascii=False)
+        )
 
-    csv_path = "evals/experiments/fast_eval_report.csv"
+    csv_path = "data/evals/experiments/fast_eval_report.csv"
     df_out.to_csv(csv_path, index=False)
     print(f"📋 Full report   → {csv_path}")
 
@@ -700,9 +710,11 @@ def save_results(df: pd.DataFrame, elapsed: float) -> None:
 async def main() -> None:
     global eval_sem
 
-    parser = argparse.ArgumentParser(description="Local RAG evaluation using RAGAS (Ollama judge, no OpenAI)")
-    parser.add_argument("--chunks",        default="chunks/chunks_processed.jsonl")
-    parser.add_argument("--dataset",       default="evals/datasets/auto_eval.jsonl")
+    parser = argparse.ArgumentParser(
+        description="RAG evaluation using RAGAS with OpenAI judge"
+    )
+    parser.add_argument("--chunks",        default="data/chunks/chunks_processed.jsonl")
+    parser.add_argument("--dataset",       default="data/evals/datasets/auto_eval.jsonl")
     parser.add_argument("--num-questions", type=int,   default=20)
     parser.add_argument("--seed",          type=int,   default=42)
     parser.add_argument("--ood-ratio",     type=float, default=0.3)
@@ -711,12 +723,10 @@ async def main() -> None:
 
     eval_sem = asyncio.Semaphore(EVAL_CONCURRENCY)
 
-    # load generation cache (skip regeneration on rerun)
     _load_gen_cache()
     if _GEN_CACHE:
         print(f"♻️  Loaded {len(_GEN_CACHE)} cached generations")
 
-    # ── Dataset ──────────────────────────────────────────────────────
     Path(args.dataset).parent.mkdir(parents=True, exist_ok=True)
     if args.regenerate or not Path(args.dataset).exists():
         print(f"\n📝 Generating dataset from {args.chunks}...")
@@ -739,12 +749,10 @@ async def main() -> None:
                     dataset.append(json.loads(line))
         print(f"📂 Loaded existing dataset ({len(dataset)} rows) from {args.dataset}")
 
-    # ── Load production indices ───────────────────────────────────────
     print("\n🔌 Loading production indices (Qdrant + BM25)...")
     vectorstore, bm25, chunks, _ = _load_production_indices()
     print(f"✅ Loaded {len(chunks)} chunks")
 
-    # ── Phase A: run RAG (retrieval + generation) for all questions ────
     print(f"\n📊 Running retrieval + generation ({EVAL_CONCURRENCY} parallel workers)...")
     start_time = time.time()
     tasks = [run_one(row, vectorstore, bm25, chunks) for row in dataset]
@@ -768,10 +776,7 @@ async def main() -> None:
         sys.stdout.flush()
     print()
 
-    # ── Phase B: judging ────────────────────────────────────────────
-    # In-scope rows -> RAGAS batch evaluation
     run_ragas_judging(results)
-    # OOD rows -> custom refusal/hallucination classifier
     await run_ood_judging(results)
 
     elapsed = time.time() - start_time

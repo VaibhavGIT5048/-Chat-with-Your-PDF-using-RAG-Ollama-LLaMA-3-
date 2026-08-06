@@ -5,7 +5,7 @@ import pickle
 import time
 from pathlib import Path
 
-import httpx
+from openai import OpenAI
 
 from APP.vector_store import (
     QdrantVectorStore,
@@ -42,9 +42,9 @@ TOP_N = 5
 
 
 def load_indices():
-    bm25_path = Path("indexes/bm25_data.pkl")
+    bm25_path = Path("data/indexes/bm25_data.pkl")
     if not bm25_path.exists():
-        raise FileNotFoundError("indexes/bm25_data.pkl not found. Run /ingest first.")
+        raise FileNotFoundError("data/indexes/bm25_data.pkl not found. Run /ingest first.")
 
     print("🔄 Loading BM25 index...")
     with open(bm25_path, "rb") as f:
@@ -55,9 +55,7 @@ def load_indices():
     print("🔄 Connecting to Qdrant...")
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
     client = QdrantClient(url=qdrant_url)
-    embeddings = load_embedding_model(
-        os.getenv("EMBEDDING_MODEL", "qllama/bge-small-en-v1.5")
-    )
+    embeddings = load_embedding_model()
     vectorstore = QdrantVectorStore(
         client=client,
         collection_name=os.getenv("QDRANT_COLLECTION", "chunks_collection"),
@@ -72,33 +70,24 @@ def load_indices():
     return vectorstore, bm25, chunks
 
 
-def generate_answer(prompt: str, model: str, ollama_url: str) -> str:
-    payload = {
-        "model": model,
-        "think": False,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0,
-            "num_predict": 512,
-        },
-    }
-    with httpx.Client(timeout=120.0) as client:
-        resp = client.post(f"{ollama_url}/api/generate", json=payload)
-        resp.raise_for_status()
-    data = resp.json()
-    return data.get("response", "").strip() if isinstance(data, dict) else str(data)
+def generate_answer(prompt: str, model: str) -> str:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    response = client.chat.completions.create(
+        model=model,
+        temperature=0,
+        max_tokens=512,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 def run_rag_chat():
-    ollama_url = os.getenv("OLLAMA_URL", "http://localhost:11434")
-    model = os.getenv("OLLAMA_GENERATOR_MODEL", "qwen3:8b")
+    model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
 
     vectorstore, bm25, chunks = load_indices()
     print(f"\n✅ RAG SYSTEM READY ({len(chunks)} chunks indexed)")
-    print(f"   Model     : {model}")
+    print(f"   Model     : {model}  [OpenAI]")
     print(f"   Top-N     : {TOP_N}")
-    print(f"   Ollama    : {ollama_url}")
     print("   Type 'exit' to quit.\n")
 
     while True:

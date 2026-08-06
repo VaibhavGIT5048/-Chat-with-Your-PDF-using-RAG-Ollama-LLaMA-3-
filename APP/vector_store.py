@@ -5,6 +5,7 @@ import json
 import pickle
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from pathlib import Path
 from langchain_core.documents import Document
@@ -96,7 +97,9 @@ def flashrank_rerank(query: str, candidates: list[Document], k: int = 5) -> list
 
     global _flashrank_ranker
     if _flashrank_ranker is None:
-        _flashrank_ranker = Ranker()
+        cache_dir = os.getenv("FLASHRANK_CACHE_DIR", "data/flashrank_cache")
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+        _flashrank_ranker = Ranker(cache_dir=cache_dir)
 
     passages = []
     for idx, doc in enumerate(candidates):
@@ -123,7 +126,7 @@ def tokenize_for_bm25(text: str) -> list[str]:
     return TOKEN_PATTERN.findall(text.lower())
 
 
-def load_passed_chunks(path="chunks/chunks_processed.jsonl"):
+def load_passed_chunks(path="data/chunks/chunks_processed.jsonl"):
     potential_paths = [Path(path), Path("../") / path]
     target_path = None
     for p in potential_paths:
@@ -152,8 +155,8 @@ def build_hybrid_indices(chunks):
         print("⚠️ No chunks to index. Skipping build.")
         return None, None
 
-    idx_dir = Path("indexes")
-    idx_dir.mkdir(exist_ok=True)
+    idx_dir = Path("data/indexes")
+    idx_dir.mkdir(parents=True, exist_ok=True)
 
     faiss_dir = idx_dir / "faiss_index"
     if faiss_dir.exists():
@@ -165,7 +168,7 @@ def build_hybrid_indices(chunks):
         print(f"ℹ️ Detected old FAISS index. Moved to {backup_target}")
 
     print("🧠 Building Qdrant Semantic Index (Dense)...")
-    embeddings = load_embedding_model("qllama/bge-small-en-v1.5:latest")
+    embeddings = load_embedding_model()
 
     if QdrantClient is None:
         print("⚠️ qdrant-client not installed.")
@@ -178,15 +181,14 @@ def build_hybrid_indices(chunks):
 
     texts = [c.page_content for c in chunks]
     batch_size = 64
-    vectors = []
-    for i in range(0, len(texts), batch_size):
-        batch_texts = texts[i: i + batch_size]
-        batch_vecs = embeddings.embed_documents(batch_texts)
-        vectors.extend(batch_vecs)
+    batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+
+    print(f"   Embedding {len(texts)} chunks in {len(batches)} batches (parallel)...")
+    with ThreadPoolExecutor(max_workers=min(8, len(batches) or 1)) as executor:
+        batch_vectors = list(executor.map(embeddings.embed_documents, batches))
+    vectors = [vec for batch in batch_vectors for vec in batch]
 
     vector_size = len(vectors[0]) if vectors else 0
-    if vector_size and vector_size != 384:
-        raise ValueError(f"Expected 384-dimensional BGE embeddings, got {vector_size}")
 
     try:
         if qdrant_models is not None:
@@ -265,13 +267,19 @@ def hybrid_retrieve(
     rrf_scores: dict = {}
     doc_map: dict = {}
 
+    # chunk_id can be absent if a Qdrant payload was written by an older or external
+    # indexer; skip those rather than dying mid-query.
     for rank, doc in enumerate(semantic_results, 1):
-        cid = doc.metadata["chunk_id"]
+        cid = doc.metadata.get("chunk_id")
+        if cid is None:
+            continue
         doc_map[cid] = doc
         rrf_scores[cid] = rrf_scores.get(cid, 0) + dense_weight / (rrf_k + rank)
 
     for rank, doc in enumerate(keyword_results, 1):
-        cid = doc.metadata["chunk_id"]
+        cid = doc.metadata.get("chunk_id")
+        if cid is None:
+            continue
         doc_map[cid] = doc
         rrf_scores[cid] = rrf_scores.get(cid, 0) + bm25_weight / (rrf_k + rank)
 
@@ -300,7 +308,11 @@ def expand_with_neighbors(
     window: int = 1,
 ) -> list[Document]:
     """Original expand — returns list[Document] without scores."""
-    id_to_doc = {doc.metadata["chunk_id"]: doc for doc in chunks}
+    id_to_doc = {
+        doc.metadata["chunk_id"]: doc
+        for doc in chunks
+        if doc.metadata.get("chunk_id") is not None
+    }
     expanded_ids: list[int] = []
 
     for doc, _ in results:
@@ -331,7 +343,11 @@ def expand_with_neighbors_scored(
     Directly-retrieved docs keep their own score. Order is preserved and
     de-duplicated (first occurrence / highest-priority anchor wins).
     """
-    id_to_doc = {doc.metadata["chunk_id"]: doc for doc in chunks}
+    id_to_doc = {
+        doc.metadata["chunk_id"]: doc
+        for doc in chunks
+        if doc.metadata.get("chunk_id") is not None
+    }
     seen: set = set()
     expanded: list[tuple[Document, float]] = []
 

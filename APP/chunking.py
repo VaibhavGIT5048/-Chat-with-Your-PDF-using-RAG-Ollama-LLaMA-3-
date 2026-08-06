@@ -3,7 +3,9 @@ import json
 from langchain_core.documents import Document
 from pathlib import Path
 
-from langchain_ollama import OllamaEmbeddings
+from langchain_openai import OpenAIEmbeddings
+
+from APP.embedding import DEFAULT_EMBEDDING_MODEL
 
 try:
     from langchain_experimental.text_splitter import SemanticChunker
@@ -22,16 +24,13 @@ def chunk_documents(
 ) -> list[Document]:
     if SemanticChunker is not None:
         try:
-            emb = OllamaEmbeddings(
-                model="qllama/bge-small-en-v1.5:latest",
-                base_url=os.getenv("OLLAMA_URL", "http://localhost:11434"),
-            )
+            emb = OpenAIEmbeddings(model=DEFAULT_EMBEDDING_MODEL, api_key=os.getenv("OPENAI_API_KEY"))
             chunker = SemanticChunker(
                 embeddings=emb,
                 breakpoint_threshold_type="percentile",
             )
             chunks = chunker.split_documents(documents)
-            print("✅ Using SemanticChunker with qllama/bge-small-en-v1.5:latest via Ollama")
+            print(f"✅ Using SemanticChunker with {DEFAULT_EMBEDDING_MODEL} via OpenAI")
         except Exception as e:
             print(f"⚠️ SemanticChunker path failed: {e}; falling back to RecursiveCharacterTextSplitter")
             if RecursiveCharacterTextSplitter is None:
@@ -153,7 +152,7 @@ if __name__ == "__main__":
     parser.add_argument("pdf_path", nargs="?", help="Path to the PDF file")
     parser.add_argument("--preview", type=int, default=3, help="Number of chunks to preview")
     parser.add_argument("--overlap-check", action="store_true", help="Show overlap for chunk 0->1")
-    parser.add_argument("--output", type=str, default="chunks/chunks.jsonl", help="Path to save chunks as JSONL")
+    parser.add_argument("--output", type=str, default="data/chunks/chunks.jsonl", help="Path to save chunks as JSONL")
     args = parser.parse_args()
 
     pdf_path = Path(args.pdf_path) if args.pdf_path else choose_pdf()

@@ -43,7 +43,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        pass  # httpx clients are context-managed, nothing to close
         logger.info("shutdown_complete")
 
 
@@ -125,7 +124,7 @@ def create_app() -> FastAPI:
     async def ready(request: Request) -> HealthStatus:
         service = get_service(request)
         status = service.health()
-        if status.qdrant != "up" or status.ollama != "up":
+        if status.qdrant != "up" or status.openai != "up":
             raise HTTPException(status_code=503, detail=status.model_dump())
         return status
 
