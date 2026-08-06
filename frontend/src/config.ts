@@ -5,6 +5,10 @@
 export const API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/+$/, '') || 'http://localhost:8000'
 
+export const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/+$/, '') ||
+  'https://vaibhavgit5048.github.io/Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama'
+
 export const REPO_URL =
   'https://github.com/VaibhavGIT5048/Semantic-Question-Answering-over-Large-Documents-using-RAG-LLaMA-3-Ollama'
 

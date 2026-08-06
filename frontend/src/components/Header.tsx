@@ -8,7 +8,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { Download, Github } from 'lucide-react'
 
-import { API_BASE_URL, REPO_URL } from '@/config'
+import { API_BASE_URL, REPO_URL, SITE_URL } from '@/config'
 import { useHealth } from '@/hooks/useHealth'
 import { useToast } from '@/hooks/useToast'
 import { useUiPrefs, type Motion } from '@/hooks/useUiPrefs'
@@ -142,6 +142,15 @@ export function Header() {
         <Button variant="ghost" onClick={onDownload}>
           <Download size={13} aria-hidden /> Instructions
         </Button>
+
+        <a
+          href={SITE_URL}
+          target="_blank"
+          rel="noreferrer"
+          className="flex items-center gap-[6px] text-[12px] font-extrabold"
+        >
+          Live site
+        </a>
 
         <a
           href={REPO_URL}

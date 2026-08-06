@@ -30,3 +30,8 @@ README.md
 # Compose/build files themselves don't need to be inside the image
 docker-compose.yml
 docker/
+!docker/frontend-nginx.conf
+
+# Frontend build artifacts and dependencies are recreated in the Docker build
+frontend/node_modules/
+frontend/.next/
