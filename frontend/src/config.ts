@@ -12,6 +12,12 @@ export const SITE_URL =
 export const REPO_URL =
   'https://github.com/VaibhavGIT5048/private-rag-core'
 
+// Sent as X-Api-Key on the routes that cost money (ingest/query/delete).
+// NOTE: this is baked into the static export's JS bundle, so it is a
+// deterrent against casual/automated abuse, not a real secret — anyone who
+// opens devtools can read it. It stops drive-by hits, not a targeted one.
+export const SHARED_API_KEY = process.env.NEXT_PUBLIC_SHARED_API_KEY || ''
+
 export const ROUTES = {
   health: '/health',
   ready: '/ready',

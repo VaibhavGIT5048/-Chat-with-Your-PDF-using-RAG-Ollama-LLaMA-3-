@@ -9,12 +9,15 @@ WORKDIR /app
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Install dependencies. The cache mount persists pip's download/wheel cache
-# across builds (in BuildKit's build cache, not an image layer), so unchanged
-# packages are never re-downloaded even when requirements.txt changes.
-COPY requirements.txt .
+# Install dependencies. requirements-api.txt is the live-API subset of
+# requirements.txt (drops ragas/datasets/requests, which only the offline
+# eval script and Streamlit UI need) — smaller image, faster cold starts.
+# The cache mount persists pip's download/wheel cache across builds (in
+# BuildKit's build cache, not an image layer), so unchanged packages are
+# never re-downloaded even when requirements-api.txt changes.
+COPY requirements-api.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt
+    pip install -r requirements-api.txt
 
 # Stage 2: Runtime
 FROM python:3.11-slim

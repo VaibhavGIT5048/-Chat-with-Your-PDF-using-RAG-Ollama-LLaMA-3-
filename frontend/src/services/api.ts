@@ -2,7 +2,7 @@
 // request has an AbortController timeout, and every failure surfaces the
 // FastAPI `detail` string plus the X-Request-ID for debuggability.
 
-import { API_BASE_URL, ROUTES, TIMEOUTS } from '@/config'
+import { API_BASE_URL, ROUTES, SHARED_API_KEY, TIMEOUTS } from '@/config'
 import type {
   CollectionInfo,
   DeleteCollectionResponse,
@@ -92,6 +92,12 @@ async function request<T>(path: string, opts: RequestOptions): Promise<T> {
   return payload as T
 }
 
+// Merged into the three routes that cost money (ingest/query/delete). Omitted
+// entirely when SHARED_API_KEY is unset, so local dev without it is unaffected.
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  return SHARED_API_KEY ? { ...extra, 'X-Api-Key': SHARED_API_KEY } : { ...extra }
+}
+
 export function getHealth(signal?: AbortSignal) {
   return request<HealthStatus>(ROUTES.health, { timeout: TIMEOUTS.health, signal })
 }
@@ -107,6 +113,7 @@ export function ingest({ file, chunkSize, chunkOverlap, qualityThreshold }: Inge
   return request<IngestResponse>(ROUTES.ingest, {
     method: 'POST',
     body: form,
+    headers: authHeaders(),
     timeout: TIMEOUTS.ingest,
   })
 }
@@ -114,7 +121,7 @@ export function ingest({ file, chunkSize, chunkOverlap, qualityThreshold }: Inge
 export function query(question: string, topK: number) {
   return request<QueryResponse>(ROUTES.query, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ question, top_k: topK }),
     timeout: TIMEOUTS.query,
   })
@@ -127,6 +134,7 @@ export function listCollections() {
 export function deleteCollection(name: string) {
   return request<DeleteCollectionResponse>(ROUTES.collection(name), {
     method: 'DELETE',
+    headers: authHeaders(),
     timeout: TIMEOUTS.health,
   })
 }

@@ -177,7 +177,7 @@ def build_hybrid_indices(chunks):
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    collection_name = "chunks_collection"
+    collection_name = os.getenv("QDRANT_COLLECTION", "chunks_collection")
 
     texts = [c.page_content for c in chunks]
     batch_size = 64

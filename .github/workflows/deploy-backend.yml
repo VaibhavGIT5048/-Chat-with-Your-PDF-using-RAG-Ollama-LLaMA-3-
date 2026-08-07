@@ -1,0 +1,44 @@
+name: Build and push backend image to GHCR
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'APP/**'
+      - 'docker/Dockerfile.api'
+      - 'requirements-api.txt'
+      - '.github/workflows/deploy-backend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.api
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/private-rag-core-api:latest
+            ghcr.io/${{ github.repository_owner }}/private-rag-core-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

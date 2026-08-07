@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -7,7 +8,7 @@ from uuid import uuid4
 
 import structlog
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -28,6 +29,16 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 logger = structlog.get_logger("rag_api")
+
+
+def require_api_key(x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> None:
+    # Unset locally -> no-op, so docker-compose/local dev keeps working unchanged.
+    # Once deployed publicly, SHARED_API_KEY gates the routes that cost money.
+    expected = os.getenv("SHARED_API_KEY")
+    if not expected:
+        return
+    if x_api_key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key")
 
 
 @asynccontextmanager
@@ -53,12 +64,19 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    default_origins = "https://vaibhavgit5048.github.io,http://localhost:3000"
+    allowed_origins = [
+        origin.strip()
+        for origin in os.getenv("CORS_ALLOWED_ORIGINS", default_origins).split(",")
+        if origin.strip()
+    ]
+
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=allowed_origins,
+        allow_credentials=False,  # no cookies used; wildcard+credentials was invalid anyway
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Content-Type", "X-Api-Key", "X-Request-ID"],
     )
 
     @app.middleware("http")
@@ -128,7 +146,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=status.model_dump())
         return status
 
-    @app.post("/ingest", response_model=IngestResponse)
+    @app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_api_key)])
     async def ingest(
         request: Request,
         file: UploadFile = File(...),
@@ -156,7 +174,7 @@ def create_app() -> FastAPI:
 
         return response.model_copy(update={"request_id": getattr(request.state, "request_id", response.request_id)})
 
-    @app.post("/query", response_model=QueryResponse)
+    @app.post("/query", response_model=QueryResponse, dependencies=[Depends(require_api_key)])
     async def query(request: Request, payload: QueryRequest) -> QueryResponse:
         service = get_service(request)
         try:
@@ -173,7 +191,7 @@ def create_app() -> FastAPI:
         service = get_service(request)
         return service.list_collections()
 
-    @app.delete("/collections/{name}")
+    @app.delete("/collections/{name}", dependencies=[Depends(require_api_key)])
     async def delete_collection(request: Request, name: str):
         service = get_service(request)
         try:
