@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
@@ -11,9 +12,60 @@ import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
+from APP import auth, db
+from APP import email as otp_email
 from APP.api_service import RAGService
-from APP.schemas import CollectionInfo, HealthStatus, IngestResponse, QueryRequest, QueryResponse
+from APP.auth import get_current_user
+from APP.schemas import (
+    AuthTokenResponse,
+    ChatTurnSummary,
+    CollectionInfo,
+    DeleteDocumentResponse,
+    DocumentSummary,
+    GoogleOAuthCallbackRequest,
+    HealthStatus,
+    IngestResponse,
+    LoginRequest,
+    OAuthCallbackRequest,
+    QueryRequest,
+    QueryResponse,
+    ResendOtpRequest,
+    SignupRequest,
+    VerifyOtpRequest,
+)
+
+# In-memory OTP resend cooldown — Phase 1's stopgap ahead of Phase 2's
+# general slowapi rate limiting; OTP endpoints are a standing abuse target
+# regardless of overall traffic, so this can't wait for Phase 2 to land.
+_otp_last_sent: dict[str, float] = {}
+OTP_RESEND_COOLDOWN_SECONDS = 60
+
+INGEST_RATE_LIMIT = os.getenv("INGEST_RATE_LIMIT", "10/hour")
+QUERY_RATE_LIMIT = os.getenv("QUERY_RATE_LIMIT", "60/hour")
+
+
+def _rate_limit_key(request: Request) -> str:
+    """Keys rate limits by the authenticated user, not IP — login is
+    mandatory, so every request that reaches these routes has one. Decodes
+    the JWT directly rather than depending on get_current_user's Depends
+    result, since slowapi's limit check isn't guaranteed to run after
+    FastAPI's own dependency resolution. Falls back to IP only for the
+    (already-401-bound) case of a missing/invalid token.
+    """
+    authorization = request.headers.get("Authorization", "")
+    if authorization.startswith("Bearer "):
+        try:
+            return auth.decode_access_token(authorization.removeprefix("Bearer ").strip())
+        except Exception:
+            pass
+    return get_remote_address(request)
+
+
+limiter = Limiter(key_func=_rate_limit_key)
 
 
 structlog.configure(
@@ -31,18 +83,9 @@ structlog.configure(
 logger = structlog.get_logger("rag_api")
 
 
-def require_api_key(x_api_key: str | None = Header(default=None, alias="X-Api-Key")) -> None:
-    # Unset locally -> no-op, so docker-compose/local dev keeps working unchanged.
-    # Once deployed publicly, SHARED_API_KEY gates the routes that cost money.
-    expected = os.getenv("SHARED_API_KEY")
-    if not expected:
-        return
-    if x_api_key != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key")
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    db.init_db()
     service = RAGService()
     app.state.rag_service = service
     app.state.collection_exists = service.collection_exists()
@@ -76,8 +119,11 @@ def create_app() -> FastAPI:
         allow_origins=allowed_origins,
         allow_credentials=False,  # no cookies used; wildcard+credentials was invalid anyway
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["Content-Type", "X-Api-Key", "X-Request-ID"],
+        allow_headers=["Content-Type", "Authorization", "X-Request-ID", "X-OpenAI-Api-Key"],
     )
+
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     @app.middleware("http")
     async def request_context_middleware(request: Request, call_next):
@@ -146,13 +192,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=status.model_dump())
         return status
 
-    @app.post("/ingest", response_model=IngestResponse, dependencies=[Depends(require_api_key)])
+    @app.post("/ingest", response_model=IngestResponse)
+    @limiter.limit(INGEST_RATE_LIMIT)
     async def ingest(
         request: Request,
         file: UploadFile = File(...),
         chunk_size: int = Form(1000),
         chunk_overlap: int = Form(150),
         quality_threshold: float = Form(4.0),
+        current_user=Depends(get_current_user),
     ) -> IngestResponse:
         service = get_service(request)
         payload = await file.read()
@@ -160,7 +208,9 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
         try:
-            response = service.ingest(
+            response = await asyncio.to_thread(
+                service.ingest,
+                owner_id=current_user["id"],
                 filename=file.filename or "upload",
                 raw_bytes=payload,
                 chunk_size=chunk_size,
@@ -174,11 +224,17 @@ def create_app() -> FastAPI:
 
         return response.model_copy(update={"request_id": getattr(request.state, "request_id", response.request_id)})
 
-    @app.post("/query", response_model=QueryResponse, dependencies=[Depends(require_api_key)])
-    async def query(request: Request, payload: QueryRequest) -> QueryResponse:
+    @app.post("/query", response_model=QueryResponse)
+    @limiter.limit(QUERY_RATE_LIMIT)
+    async def query(
+        request: Request,
+        payload: QueryRequest,
+        current_user=Depends(get_current_user),
+        x_openai_api_key: str | None = Header(default=None, alias="X-OpenAI-Api-Key"),
+    ) -> QueryResponse:
         service = get_service(request)
         try:
-            response = service.answer(payload)
+            response = await asyncio.to_thread(service.answer, current_user["id"], payload, x_openai_api_key)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -191,14 +247,127 @@ def create_app() -> FastAPI:
         service = get_service(request)
         return service.list_collections()
 
-    @app.delete("/collections/{name}", dependencies=[Depends(require_api_key)])
-    async def delete_collection(request: Request, name: str):
+    @app.delete("/collections/{name}")
+    async def delete_collection(request: Request, name: str, current_user=Depends(get_current_user)):
         service = get_service(request)
         try:
             service.delete_collection(name)
         except Exception as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"deleted": name, "request_id": getattr(request.state, "request_id", str(uuid4()))}
+
+    # ----------------------------------------------------------------- #
+    # Auth — GitHub/Google OAuth, email+password+OTP. None of these
+    # depend on get_current_user; they're what issues the JWT in the
+    # first place.
+    # ----------------------------------------------------------------- #
+
+    @app.post("/auth/github/callback", response_model=AuthTokenResponse)
+    async def github_callback(payload: OAuthCallbackRequest) -> AuthTokenResponse:
+        try:
+            result = await asyncio.to_thread(auth.exchange_github_code, payload.code)
+        except auth.OAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"GitHub sign-in failed: {exc}") from exc
+
+        user_id = db.get_or_create_user_for_oauth(result["email"], "github", result["provider_user_id"])
+        token = auth.create_access_token(user_id)
+        return AuthTokenResponse(access_token=token, user_id=user_id, email=result["email"])
+
+    @app.post("/auth/google/callback", response_model=AuthTokenResponse)
+    async def google_callback(payload: GoogleOAuthCallbackRequest) -> AuthTokenResponse:
+        try:
+            result = await asyncio.to_thread(auth.exchange_google_code, payload.code, payload.redirect_uri)
+        except auth.OAuthError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Google sign-in failed: {exc}") from exc
+
+        user_id = db.get_or_create_user_for_oauth(result["email"], "google", result["provider_user_id"])
+        token = auth.create_access_token(user_id)
+        return AuthTokenResponse(access_token=token, user_id=user_id, email=result["email"])
+
+    def _issue_and_send_otp(user_id: str, email_address: str) -> None:
+        code = auth.generate_otp_code()
+        db.create_otp(user_id, auth.hash_otp_code(code))
+        otp_email.send_otp_email(email_address, code)
+        _otp_last_sent[email_address] = time.monotonic()
+
+    @app.post("/auth/signup", status_code=201)
+    async def signup(payload: SignupRequest) -> dict:
+        existing = db.get_user_by_email(payload.email)
+        if existing is not None and existing["email_verified"]:
+            raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+        if existing is None:
+            user_id = db.create_user(payload.email, password_hash=auth.hash_password(payload.password))
+        else:
+            user_id = existing["id"]  # unverified retry — reuse the row, issue a fresh code
+
+        await asyncio.to_thread(_issue_and_send_otp, user_id, payload.email)
+        return {"detail": "Verification code sent"}
+
+    @app.post("/auth/verify-otp", response_model=AuthTokenResponse)
+    async def verify_otp(payload: VerifyOtpRequest) -> AuthTokenResponse:
+        user = db.get_user_by_email(payload.email)
+        if user is None:
+            raise HTTPException(status_code=400, detail="Invalid code")
+
+        otp = db.get_latest_otp(user["id"])
+        if otp is None or auth.is_otp_expired(otp["expires_at"]) or not auth.verify_otp_code(payload.code, otp["code_hash"]):
+            raise HTTPException(status_code=400, detail="Invalid or expired code")
+
+        db.consume_otp(otp["id"])
+        db.set_email_verified(user["id"])
+        token = auth.create_access_token(user["id"])
+        return AuthTokenResponse(access_token=token, user_id=user["id"], email=payload.email)
+
+    @app.post("/auth/resend-otp", status_code=202)
+    async def resend_otp(payload: ResendOtpRequest) -> dict:
+        last_sent = _otp_last_sent.get(payload.email)
+        if last_sent is not None and (time.monotonic() - last_sent) < OTP_RESEND_COOLDOWN_SECONDS:
+            raise HTTPException(status_code=429, detail="Please wait before requesting another code")
+
+        user = db.get_user_by_email(payload.email)
+        if user is not None and not user["email_verified"]:
+            await asyncio.to_thread(_issue_and_send_otp, user["id"], payload.email)
+        # Same response whether or not the account exists/is already
+        # verified — do not let this endpoint be used to enumerate emails.
+        return {"detail": "If that account needs verification, a new code has been sent"}
+
+    @app.post("/auth/login", response_model=AuthTokenResponse)
+    async def login(payload: LoginRequest) -> AuthTokenResponse:
+        user = db.get_user_by_email(payload.email)
+        if user is None or not user["password_hash"] or not auth.verify_password(payload.password, user["password_hash"]):
+            raise HTTPException(status_code=401, detail="Incorrect email or password")
+        if not user["email_verified"]:
+            raise HTTPException(status_code=403, detail="Email not verified")
+
+        token = auth.create_access_token(user["id"])
+        return AuthTokenResponse(access_token=token, user_id=user["id"], email=payload.email)
+
+    # ----------------------------------------------------------------- #
+    # Documents — list/resume/delete, all scoped to the authenticated user.
+    # ----------------------------------------------------------------- #
+
+    @app.get("/documents", response_model=list[DocumentSummary])
+    async def list_documents(request: Request, current_user=Depends(get_current_user)) -> list[DocumentSummary]:
+        service = get_service(request)
+        return service.list_documents(current_user["id"])
+
+    @app.get("/documents/{document_id}/history", response_model=list[ChatTurnSummary])
+    async def document_history(request: Request, document_id: str, current_user=Depends(get_current_user)) -> list[ChatTurnSummary]:
+        service = get_service(request)
+        return service.get_chat_history(document_id, current_user["id"])
+
+    @app.delete("/documents/{document_id}", response_model=DeleteDocumentResponse)
+    async def delete_document(request: Request, document_id: str, current_user=Depends(get_current_user)) -> DeleteDocumentResponse:
+        service = get_service(request)
+        deleted = service.remove_document(document_id, current_user["id"])
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return DeleteDocumentResponse(document_id=document_id, deleted=True)
 
     return app
 

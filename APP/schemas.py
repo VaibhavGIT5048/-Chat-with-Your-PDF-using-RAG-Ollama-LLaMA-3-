@@ -13,6 +13,7 @@ class SourceChunk(BaseModel):
 
 class IngestResponse(BaseModel):
     request_id: str
+    document_id: str
     collection_name: str
     filename: str
     file_type: str
@@ -25,6 +26,7 @@ class IngestResponse(BaseModel):
 
 
 class QueryRequest(BaseModel):
+    document_id: str
     question: str = Field(min_length=1)
     top_k: int = Field(default=4, ge=1, le=20)
 
@@ -35,6 +37,69 @@ class QueryResponse(BaseModel):
     sources: list[SourceChunk] = Field(default_factory=list)
     model: str
     collection_name: str
+
+
+# --------------------------------------------------------------------------- #
+# Auth
+# --------------------------------------------------------------------------- #
+
+class OAuthCallbackRequest(BaseModel):
+    code: str = Field(min_length=1)
+
+
+class GoogleOAuthCallbackRequest(OAuthCallbackRequest):
+    redirect_uri: str = Field(min_length=1)
+
+
+class SignupRequest(BaseModel):
+    email: str = Field(min_length=3)
+    password: str = Field(min_length=8)
+
+
+class VerifyOtpRequest(BaseModel):
+    email: str
+    code: str = Field(min_length=6, max_length=6)
+
+
+class ResendOtpRequest(BaseModel):
+    email: str
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class AuthTokenResponse(BaseModel):
+    access_token: str
+    user_id: str
+    email: str
+
+
+# --------------------------------------------------------------------------- #
+# Documents / chat history
+# --------------------------------------------------------------------------- #
+
+class DocumentSummary(BaseModel):
+    id: str
+    filename: str
+    ingested_at: str
+    pages: int | None = None
+    chunks: int | None = None
+    indexed_chunks: int | None = None
+
+
+class ChatTurnSummary(BaseModel):
+    id: str
+    question: str
+    answer: str
+    sources: list[SourceChunk] = Field(default_factory=list)
+    created_at: str
+
+
+class DeleteDocumentResponse(BaseModel):
+    document_id: str
+    deleted: bool
 
 
 class HealthStatus(BaseModel):

@@ -13,16 +13,19 @@ load_dotenv()
 
 tokenizer = tiktoken.get_encoding("cl100k_base")
 
-# Lazy embedding adapter — uses OpenAI embeddings (same model as the rest of the stack)
-# No torch/sentence_transformers needed; loads only on first /ingest call
+# Lazy embedding provider — the same self-hosted default (bge-m3) the rest of
+# the stack embeds with, so a chunk scored here is measured against vectors
+# comparable to the ones actually indexed. Only reached when apply_quality_gate
+# is called WITHOUT precomputed vectors; the /ingest path passes them in, so
+# this normally never loads at all.
 _embedder = None
 
 
 def _get_embedder():
     global _embedder
     if _embedder is None:
-        from APP.embedding import load_embedding_model
-        _embedder = load_embedding_model()
+        from APP.providers.embedding import build_default_embedding_provider
+        _embedder = build_default_embedding_provider()
     return _embedder
 
 
@@ -60,7 +63,12 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
 # ─────────────────────────────────────────────────────────────────────
 # THE REFINED QUALITY EVALUATOR
 # ─────────────────────────────────────────────────────────────────────
-def evaluate_chunk_refined(current_chunk: Document, previous_chunk: Document | None) -> dict:
+def evaluate_chunk_refined(
+    current_chunk: Document,
+    previous_chunk: Document | None,
+    current_vector: list[float] | None = None,
+    previous_vector: list[float] | None = None,
+) -> dict:
     text = current_chunk.page_content.strip()
     score = 0.0
     features = {"X_T": 0, "X_P": 0, "X_E": 0, "X_C": 0}
@@ -100,15 +108,24 @@ def evaluate_chunk_refined(current_chunk: Document, previous_chunk: Document | N
         features["X_E"] = 1
         score += (1 * W_ENTITIES)
 
-    # 4. X_C (Refined Overlap) — uses Ollama BGE via lazy loader
+    # 4. X_C (Refined Overlap) — reuses precomputed vectors when the caller
+    # has them (the embedding-pass consolidation: chunk embeddings are
+    # computed once up front and threaded through here and into indexing,
+    # instead of this function re-embedding every adjacent pair itself).
+    # Falls back to embedding on demand if no vector was supplied, so
+    # standalone callers (the CLI entry point below) keep working unchanged.
     overlap_sim = 0.0
     if previous_chunk is None or not _same_section(previous_chunk, current_chunk):
         features["X_C"] = 1
         score += (1 * W_OVERLAP)
     else:
-        embedder = _get_embedder()
-        vecs = embedder.embed_documents([previous_chunk.page_content, text])
-        overlap_sim = _cosine_sim(vecs[0], vecs[1])
+        if current_vector is not None and previous_vector is not None:
+            vec_current, vec_previous = current_vector, previous_vector
+        else:
+            embedder = _get_embedder()
+            vecs = embedder.embed_documents([previous_chunk.page_content, text])
+            vec_previous, vec_current = vecs[0], vecs[1]
+        overlap_sim = _cosine_sim(vec_previous, vec_current)
 
         if 0.05 <= overlap_sim <= 0.95:
             features["X_C"] = 1
@@ -128,15 +145,20 @@ def evaluate_chunk_refined(current_chunk: Document, previous_chunk: Document | N
 # ─────────────────────────────────────────────────────────────────────
 # QUALITY GATE EXECUTION
 # ─────────────────────────────────────────────────────────────────────
-def apply_quality_gate(chunks: list[Document], threshold_score: float = 4.0):
+def apply_quality_gate(chunks: list[Document], threshold_score: float = 4.0, vectors: list[list[float]] | None = None):
+    """`vectors`, if given, must be aligned index-for-index with `chunks` —
+    computed once by the caller instead of re-embedded here per adjacent pair.
+    """
     processed_chunks = []
     passed_count = 0
 
     print(f"\n{'═'*60}\n RUNNING REFINED QUALITY GATE (Threshold: {threshold_score}/{MAX_SCORE})\n{'═'*60}")
 
     previous_chunk = None
-    for chunk in chunks:
-        evaluation = evaluate_chunk_refined(chunk, previous_chunk)
+    previous_vector = None
+    for i, chunk in enumerate(chunks):
+        current_vector = vectors[i] if vectors is not None else None
+        evaluation = evaluate_chunk_refined(chunk, previous_chunk, current_vector, previous_vector)
 
         chunk.metadata["strict_score"] = evaluation["total_score"]
         chunk.metadata["passed_gate"] = evaluation["total_score"] >= threshold_score
@@ -147,6 +169,7 @@ def apply_quality_gate(chunks: list[Document], threshold_score: float = 4.0):
 
         processed_chunks.append(chunk)
         previous_chunk = chunk
+        previous_vector = current_vector
 
     print(f"Total Chunks Processed : {len(chunks)}")
     print(f"Passed (Status: True)  : {passed_count} chunks")

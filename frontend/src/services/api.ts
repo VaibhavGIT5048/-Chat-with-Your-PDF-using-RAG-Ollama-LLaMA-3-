@@ -2,7 +2,7 @@
 // request has an AbortController timeout, and every failure surfaces the
 // FastAPI `detail` string plus the X-Request-ID for debuggability.
 
-import { API_BASE_URL, ROUTES, SHARED_API_KEY, TIMEOUTS } from '@/config'
+import { API_BASE_URL, BYO_OPENAI_KEY_HEADER, ROUTES, SHARED_API_KEY, TIMEOUTS } from '@/config'
 import type {
   CollectionInfo,
   DeleteCollectionResponse,
@@ -118,10 +118,13 @@ export function ingest({ file, chunkSize, chunkOverlap, qualityThreshold }: Inge
   })
 }
 
-export function query(question: string, topK: number) {
+export function query(question: string, topK: number, byoOpenAiKey?: string) {
+  const extra: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (byoOpenAiKey) extra[BYO_OPENAI_KEY_HEADER] = byoOpenAiKey
+
   return request<QueryResponse>(ROUTES.query, {
     method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    headers: authHeaders(extra),
     body: JSON.stringify({ question, top_k: topK }),
     timeout: TIMEOUTS.query,
   })

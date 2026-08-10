@@ -5,11 +5,35 @@ import json
 import pickle
 import re
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from pathlib import Path
 from langchain_core.documents import Document
-from APP.embedding import load_embedding_model
+from APP.providers.embedding import build_default_embedding_provider
+
+# Filtered HNSW search loses recall unless ef_search is raised above the
+# collection's default ef_construct (100) to compensate — every query is
+# document/owner-filtered now, so this always applies, not just sometimes.
+EF_SEARCH = 128
+
+# Must match APP/api_service.py's BackendSettings.qdrant_collection default —
+# if these two drift, ingest writes to one collection while /health and the
+# ingest response report another.
+DEFAULT_COLLECTION = "chunks_collection_v2"
+
+
+def document_index_dir(owner_id: str, document_id: str) -> Path:
+    return Path("data/documents") / owner_id / document_id
+
+
+def qdrant_point_id(document_id: str, chunk_index: int) -> str:
+    """Stable, globally-unique point id: the document's own UUID is used as
+    the uuid5 namespace, so the same local chunk_index in a different
+    document can never collide — this is what let multi-document ingest
+    stop destructively recreating the collection every time.
+    """
+    return str(uuid.uuid5(uuid.UUID(document_id), str(chunk_index)))
 
 try:
     from rank_bm25 import BM25Okapi
@@ -31,10 +55,25 @@ except Exception:
 
 
 class QdrantVectorStore:
-    def __init__(self, client, collection_name: str, embeddings):
+    def __init__(self, client, collection_name: str, embeddings, document_id: str | None = None, owner_id: str | None = None):
         self.client = client
         self.collection_name = collection_name
         self.embeddings = embeddings
+        self.document_id = document_id
+        self.owner_id = owner_id
+
+    def _scope_filter(self):
+        """Every query is scoped to one document/owner now — this is what
+        replaces "one collection per document" with "one shared collection,
+        filtered per query," and is why EF_SEARCH exists (filtered HNSW
+        search loses recall unless ef_search compensates for it).
+        """
+        if qdrant_models is None or self.document_id is None:
+            return None
+        conditions = [qdrant_models.FieldCondition(key="document_id", match=qdrant_models.MatchValue(value=self.document_id))]
+        if self.owner_id is not None:
+            conditions.append(qdrant_models.FieldCondition(key="owner_id", match=qdrant_models.MatchValue(value=self.owner_id)))
+        return qdrant_models.Filter(must=conditions)
 
     def similarity_search(self, query: str, k: int = 5):
         qvec = None
@@ -46,11 +85,16 @@ class QdrantVectorStore:
             except Exception:
                 raise RuntimeError("Embedding backend not available for queries.")
 
+        query_filter = self._scope_filter()
+        search_params = qdrant_models.SearchParams(hnsw_ef=EF_SEARCH) if qdrant_models is not None else None
+
         hits = None
         try:
             hits = self.client.query_points(
                 collection_name=self.collection_name,
                 query=qvec,
+                query_filter=query_filter,
+                search_params=search_params,
                 limit=k,
                 with_payload=True,
             ).points
@@ -62,6 +106,8 @@ class QdrantVectorStore:
                 hits = self.client.search(
                     collection_name=self.collection_name,
                     query_vector=qvec,
+                    query_filter=query_filter,
+                    search_params=search_params,
                     limit=k,
                     with_payload=True,
                 )
@@ -150,25 +196,38 @@ def load_passed_chunks(path="data/chunks/chunks_processed.jsonl"):
     return processed_chunks
 
 
-def build_hybrid_indices(chunks):
+def _collection_exists(client, collection_name: str) -> bool:
+    try:
+        return client.collection_exists(collection_name)
+    except AttributeError:
+        try:
+            client.get_collection(collection_name)
+            return True
+        except Exception:
+            return False
+
+
+def build_hybrid_indices(chunks, document_id: str, owner_id: str, vectors: list[list[float]] | None = None, embeddings=None):
+    """Indexes one document's chunks into the shared Qdrant collection
+    (create-if-missing + upsert — never destructive, unlike the old
+    per-ingest recreate_collection) and writes that document's own BM25
+    pickle under data/documents/{owner_id}/{document_id}/.
+
+    `vectors`, if given, are used as-is instead of re-embedding here — this
+    is the embedding-pass consolidation: the caller computes chunk
+    embeddings once, in parallel, and feeds the same vectors into both the
+    quality-gate overlap check and this indexing step.
+    """
     if not chunks:
         print("⚠️ No chunks to index. Skipping build.")
         return None, None
 
-    idx_dir = Path("data/indexes")
-    idx_dir.mkdir(parents=True, exist_ok=True)
-
-    faiss_dir = idx_dir / "faiss_index"
-    if faiss_dir.exists():
-        backup_dir = idx_dir / "faiss_index_backup"
-        timestamp = int(time.time())
-        backup_target = backup_dir / str(timestamp)
-        backup_target.parent.mkdir(parents=True, exist_ok=True)
-        faiss_dir.rename(backup_target)
-        print(f"ℹ️ Detected old FAISS index. Moved to {backup_target}")
-
-    print("🧠 Building Qdrant Semantic Index (Dense)...")
-    embeddings = load_embedding_model()
+    print("🧠 Indexing into Qdrant (Dense)...")
+    # Defaults to the same self-hosted provider the caller embedded with —
+    # never the old OpenAI adapter. Getting this wrong is silent but fatal:
+    # the vectorstore returned below would embed queries at a different
+    # dimension than the collection was built with.
+    embeddings = embeddings or build_default_embedding_provider()
 
     if QdrantClient is None:
         print("⚠️ qdrant-client not installed.")
@@ -177,28 +236,20 @@ def build_hybrid_indices(chunks):
     qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_api_key = os.getenv("QDRANT_API_KEY")
     client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
-    collection_name = os.getenv("QDRANT_COLLECTION", "chunks_collection")
+    collection_name = os.getenv("QDRANT_COLLECTION", DEFAULT_COLLECTION)
 
-    texts = [c.page_content for c in chunks]
-    batch_size = 64
-    batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
-
-    print(f"   Embedding {len(texts)} chunks in {len(batches)} batches (parallel)...")
-    with ThreadPoolExecutor(max_workers=min(8, len(batches) or 1)) as executor:
-        batch_vectors = list(executor.map(embeddings.embed_documents, batches))
-    vectors = [vec for batch in batch_vectors for vec in batch]
+    if vectors is None:
+        texts = [c.page_content for c in chunks]
+        batch_size = 64
+        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+        print(f"   Embedding {len(texts)} chunks in {len(batches)} batches (parallel)...")
+        with ThreadPoolExecutor(max_workers=min(8, len(batches) or 1)) as executor:
+            batch_vectors = list(executor.map(embeddings.embed_documents, batches))
+        vectors = [vec for batch in batch_vectors for vec in batch]
 
     vector_size = len(vectors[0]) if vectors else 0
 
-    try:
-        if qdrant_models is not None:
-            client.recreate_collection(
-                collection_name=collection_name,
-                vectors_config=qdrant_models.VectorParams(size=vector_size, distance=qdrant_models.Distance.COSINE),
-            )
-        else:
-            client.recreate_collection(collection_name=collection_name, vectors_config={"size": vector_size, "distance": "Cosine"})
-    except Exception:
+    if not _collection_exists(client, collection_name):
         try:
             if qdrant_models is not None:
                 client.create_collection(
@@ -206,31 +257,66 @@ def build_hybrid_indices(chunks):
                     vectors_config=qdrant_models.VectorParams(size=vector_size, distance=qdrant_models.Distance.COSINE),
                 )
             else:
-                client.create_collection(collection_name=collection_name, vector_size=vector_size, distance="Cosine")
+                client.create_collection(collection_name=collection_name, vectors_config={"size": vector_size, "distance": "Cosine"})
         except Exception:
             pass
 
     points = []
     for c, v in zip(chunks, vectors):
-        pid = int(c.metadata.get("chunk_id", len(points)))
-        payload = {"text": c.page_content, "metadata": c.metadata}
+        chunk_index = int(c.metadata.get("chunk_id", len(points)))
+        pid = qdrant_point_id(document_id, chunk_index)
+        payload = {"text": c.page_content, "metadata": c.metadata, "document_id": document_id, "owner_id": owner_id}
         if qdrant_models is not None:
             points.append(qdrant_models.PointStruct(id=pid, vector=v, payload=payload))
         else:
             points.append({"id": pid, "vector": v, "payload": payload})
 
     client.upsert(collection_name=collection_name, points=points)
-    vectorstore = QdrantVectorStore(client=client, collection_name=collection_name, embeddings=embeddings)
+    vectorstore = QdrantVectorStore(
+        client=client, collection_name=collection_name, embeddings=embeddings,
+        document_id=document_id, owner_id=owner_id,
+    )
 
-    print("📝 Building BM25 Keyword Index (Sparse)...")
+    print("📝 Building this document's BM25 Keyword Index (Sparse)...")
     tokenized_corpus = [tokenize_for_bm25(doc.page_content) for doc in chunks]
     bm25 = BM25Okapi(tokenized_corpus)
 
-    with open(idx_dir / "bm25_data.pkl", "wb") as f:
+    doc_dir = document_index_dir(owner_id, document_id)
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    with open(doc_dir / "bm25.pkl", "wb") as f:
         pickle.dump({"bm25": bm25, "chunks": chunks}, f)
 
-    print(f"✅ All indices built. Saved to: {idx_dir.absolute()}")
+    print(f"✅ Document indexed. BM25 saved to: {doc_dir.absolute()}")
     return vectorstore, bm25
+
+
+def load_document_index(document_id: str, owner_id: str, embeddings=None) -> tuple[QdrantVectorStore | None, object | None, list[Document] | None]:
+    """Loads the pieces needed for /query on one document: a document-scoped
+    QdrantVectorStore plus that document's own BM25 index and chunks.
+    """
+    doc_dir = document_index_dir(owner_id, document_id)
+    bm25_path = doc_dir / "bm25.pkl"
+    if not bm25_path.exists():
+        return None, None, None
+
+    with open(bm25_path, "rb") as f:
+        data = pickle.load(f)
+    bm25 = data["bm25"]
+    chunks = data["chunks"]
+
+    if QdrantClient is None:
+        return None, bm25, chunks
+
+    embeddings = embeddings or build_default_embedding_provider()
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
+    client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key)
+    collection_name = os.getenv("QDRANT_COLLECTION", DEFAULT_COLLECTION)
+    vectorstore = QdrantVectorStore(
+        client=client, collection_name=collection_name, embeddings=embeddings,
+        document_id=document_id, owner_id=owner_id,
+    )
+    return vectorstore, bm25, chunks
 
 
 def apply_quality_penalty(chunks, base_scores):
@@ -372,7 +458,7 @@ if __name__ == "__main__":
     print(f"📥 Found {len(all_passed)} chunks to index.")
 
     if all_passed:
-        vs, bm = build_hybrid_indices(all_passed)
+        vs, bm = build_hybrid_indices(all_passed, document_id=str(uuid.uuid4()), owner_id="debug-cli")
         test_query = input("\nEnter a test query: ")
         results = hybrid_retrieve(test_query, vs, bm, all_passed)
         for i, (doc, score) in enumerate(results, 1):

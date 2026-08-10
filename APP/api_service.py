@@ -2,54 +2,79 @@ from __future__ import annotations
 
 import json
 import os
-import pickle
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import Any
 from uuid import uuid4
 
+import tiktoken
 from langchain_core.documents import Document
-from openai import OpenAI
 from qdrant_client import QdrantClient
 
+from APP import db
 from APP.chunking import chunk_documents, save_chunks_jsonl
-from APP.embedding import DEFAULT_EMBEDDING_MODEL, load_embedding_model
 from APP.generator import SYSTEM_PROMPT
 from APP.pdf_loading import load_pdf
+from APP.providers import (
+    ChatProvider,
+    EmbeddingProvider,
+    OpenAIChatProvider,
+    build_default_chat_provider,
+    build_default_embedding_provider,
+)
 from APP.quality_gate import apply_quality_gate, save_chunks_jsonl as save_processed_jsonl
-from APP.schemas import HealthStatus, IngestResponse, QueryRequest, QueryResponse, SourceChunk, CollectionInfo
+from APP.schemas import (
+    ChatTurnSummary,
+    CollectionInfo,
+    DocumentSummary,
+    HealthStatus,
+    IngestResponse,
+    QueryRequest,
+    QueryResponse,
+    SourceChunk,
+)
 from APP.vector_store import (
     QdrantVectorStore,
     build_hybrid_indices,
     expand_with_neighbors_scored,
     hybrid_retrieve,
+    load_document_index,
 )
+
+_CONTEXT_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "6000"))
+REWRITE_HISTORY_TURNS = 3
 
 
 @dataclass(slots=True)
 class BackendSettings:
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     qdrant_api_key: str | None = os.getenv("QDRANT_API_KEY")
-    qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "chunks_collection")
-    openai_api_key: str | None = os.getenv("OPENAI_API_KEY")
-    openai_chat_model: str = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-    embedding_model: str = DEFAULT_EMBEDDING_MODEL
-    openai_health_ttl: float = float(os.getenv("OPENAI_HEALTH_TTL", "60"))
+    # _v2 because Phase 2 switches the default embedding model to bge-m3
+    # (1024-dim) from text-embedding-3-small (1536-dim) — a fresh collection
+    # name avoids a dimension mismatch against (or destructively recreating)
+    # whatever already lives in the old "chunks_collection".
+    qdrant_collection: str = os.getenv("QDRANT_COLLECTION", "chunks_collection_v2")
+    chat_health_ttl: float = float(os.getenv("CHAT_HEALTH_TTL", "60"))
 
 
 class RAGService:
     def __init__(self, settings: BackendSettings | None = None):
         self.settings = settings or BackendSettings()
         self.qdrant = QdrantClient(url=self.settings.qdrant_url, api_key=self.settings.qdrant_api_key)
-        self.openai_client = OpenAI(api_key=self.settings.openai_api_key)
-        self.embedding_adapter = load_embedding_model(self.settings.embedding_model)
-        self._cached_chunks: list[Document] = []
-        self._cached_bm25 = None
-        self._cached_vectorstore = None
-        self._openai_probe_ok = False
-        self._openai_probe_at: float | None = None
+        # Default chat = Azure OpenAI Service (gpt-5-mini); default embeddings
+        # = self-hosted bge-m3. Both lazy-constructed internally — nothing
+        # here downloads model weights or validates a key at startup.
+        self.chat_provider: ChatProvider = build_default_chat_provider()
+        self.embedding_provider: EmbeddingProvider = build_default_embedding_provider()
+        # No single-slot cache anymore — every document has its own BM25
+        # pickle + Qdrant filter, so "the cached one" isn't a meaningful
+        # concept once multiple documents/owners exist concurrently.
+        self._chat_probe_ok = False
+        self._chat_probe_at: float | None = None
 
     def collection_exists(self, name: str | None = None) -> bool:
         collection_name = name or self.settings.qdrant_collection
@@ -82,10 +107,6 @@ class RAGService:
 
     def delete_collection(self, name: str) -> None:
         self.qdrant.delete_collection(name)
-        if name == self.settings.qdrant_collection:
-            self._cached_vectorstore = None
-            self._cached_bm25 = None
-            self._cached_chunks = []
 
     def _load_upload_to_docs(self, filename: str, raw_bytes: bytes) -> list[Document]:
         suffix = Path(filename).suffix.lower()
@@ -114,7 +135,20 @@ class RAGService:
             except Exception:
                 pass
 
-    def ingest(self, filename: str, raw_bytes: bytes, chunk_size: int, chunk_overlap: int, quality_threshold: float) -> IngestResponse:
+    def _embed_parallel(self, texts: list[str]) -> list[list[float]]:
+        """Computes every chunk's embedding once, in parallel — the same
+        vectors are then reused for the quality-gate overlap check and for
+        indexing, instead of each of those re-embedding independently.
+        """
+        if not texts:
+            return []
+        batch_size = 64
+        batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+        with ThreadPoolExecutor(max_workers=min(8, len(batches) or 1)) as executor:
+            batch_vectors = list(executor.map(self.embedding_provider.embed_documents, batches))
+        return [vec for batch in batch_vectors for vec in batch]
+
+    def ingest(self, owner_id: str, filename: str, raw_bytes: bytes, chunk_size: int, chunk_overlap: int, quality_threshold: float) -> IngestResponse:
         docs = self._load_upload_to_docs(filename, raw_bytes)
         if not docs:
             raise ValueError(f"No text could be extracted from {filename}")
@@ -123,21 +157,35 @@ class RAGService:
         Path("data/chunks").mkdir(parents=True, exist_ok=True)
         save_chunks_jsonl(chunks, "data/chunks/chunks.jsonl")
 
-        processed_chunks = apply_quality_gate(chunks, threshold_score=quality_threshold)
+        # Compute every chunk's embedding once, up front — feeds both the
+        # quality-gate overlap check and indexing below, collapsing what
+        # used to be three separate embedding passes into one.
+        vectors = self._embed_parallel([c.page_content for c in chunks])
+
+        processed_chunks = apply_quality_gate(chunks, threshold_score=quality_threshold, vectors=vectors)
         save_processed_jsonl(processed_chunks, "data/chunks/chunks_processed.jsonl")
         passed_chunks = [c for c in processed_chunks if c.metadata.get("passed_gate") is True]
-        retrieval_chunks = [c for c in processed_chunks if c.page_content.strip()]
+
+        retrieval_chunks: list[Document] = []
+        retrieval_vectors: list[list[float]] = []
+        for chunk, vector in zip(processed_chunks, vectors):
+            if chunk.page_content.strip():
+                retrieval_chunks.append(chunk)
+                retrieval_vectors.append(vector)
 
         if not retrieval_chunks:
             raise RuntimeError("No retrievable chunks were produced. Inspect document extraction quality.")
 
-        vectorstore, bm25 = build_hybrid_indices(retrieval_chunks)
-        self._cached_vectorstore = vectorstore
-        self._cached_bm25 = bm25
-        self._cached_chunks = retrieval_chunks
+        document_id = db.create_document(owner_id, filename, pages=len(docs))
+        build_hybrid_indices(
+            retrieval_chunks, document_id=document_id, owner_id=owner_id,
+            vectors=retrieval_vectors, embeddings=self.embedding_provider,
+        )
+        db.update_document_counts(document_id, chunks=len(retrieval_chunks), indexed_chunks=len(retrieval_chunks))
 
         stats = IngestResponse(
             request_id=str(uuid4()),
+            document_id=document_id,
             collection_name=self.settings.qdrant_collection,
             filename=filename,
             file_type=Path(filename).suffix.lstrip(".").lower() or "unknown",
@@ -150,35 +198,75 @@ class RAGService:
         )
         return stats
 
-    def _load_cached_artifacts(self) -> tuple[QdrantVectorStore, Any, list[Document]]:
-        if self._cached_vectorstore is not None and self._cached_bm25 is not None and self._cached_chunks:
-            return self._cached_vectorstore, self._cached_bm25, self._cached_chunks
-
-        bm25_path = Path("data/indexes/bm25_data.pkl")
-        if not bm25_path.exists():
-            raise FileNotFoundError("BM25 artifacts not found. Run /ingest first.")
-
-        with open(bm25_path, "rb") as f:
-            data = pickle.load(f)
-            bm25, chunks = data["bm25"], data["chunks"]
-
-        vectorstore = QdrantVectorStore(
-            client=self.qdrant,
-            collection_name=self.settings.qdrant_collection,
-            embeddings=self.embedding_adapter,
-        )
-        self._cached_vectorstore = vectorstore
-        self._cached_bm25 = bm25
-        self._cached_chunks = chunks
+    def _load_document_artifacts(self, document_id: str, owner_id: str) -> tuple[QdrantVectorStore, Any, list[Document]]:
+        # Always the default embedding provider, never a BYO override — a
+        # document's vectors are permanently tied to whichever model/dimension
+        # indexed them, and the collection has one fixed vector size, so query
+        # embeddings must always match the same provider ingest used.
+        vectorstore, bm25, chunks = load_document_index(document_id, owner_id, embeddings=self.embedding_provider)
+        if vectorstore is None or bm25 is None or chunks is None:
+            raise FileNotFoundError(f"No index found for document {document_id}. Run /ingest first.")
         return vectorstore, bm25, chunks
 
-    def answer(self, request: QueryRequest) -> QueryResponse:
-        vectorstore, bm25, chunks = self._load_cached_artifacts()
+    def _rewrite_query_if_needed(self, question: str, history: list, chat_provider: ChatProvider) -> str:
+        """Resolves a follow-up question ("what about the second one") against
+        recent turns before it hits retrieval. Skipped entirely when there's
+        no history — the common first-turn case pays nothing extra.
+        """
+        if not history:
+            return question
+
+        turns_text = "\n".join(f"Q: {t['question']}\nA: {t['answer']}" for t in history[-REWRITE_HISTORY_TURNS:])
+        prompt = (
+            "Rewrite the follow-up question into a fully self-contained question, "
+            "resolving any pronouns or references using the conversation history below. "
+            "Reply with only the rewritten question, nothing else.\n\n"
+            f"HISTORY:\n{turns_text}\n\nFOLLOW-UP QUESTION:\n{question}\n\nREWRITTEN QUESTION:"
+        )
+        try:
+            rewritten = chat_provider.complete(prompt, max_tokens=100, temperature=0).strip()
+            return rewritten or question
+        except Exception:
+            # Retrieval on the raw question is strictly better than failing
+            # the whole request over an optional rewrite step.
+            return question
+
+    @staticmethod
+    def _build_context_blob(expanded: list[tuple[Document, float]], max_tokens: int) -> tuple[str, list[tuple[Document, float]]]:
+        """Joins retrieved chunks into the context blob, dropping the
+        lowest-priority chunks first if the token count would overflow the
+        model's input window instead of silently sending an oversized prompt.
+        """
+        kept = list(expanded)
+        while kept:
+            contexts = [
+                f"[Source: {doc.metadata.get('source', 'unknown')} | Page: {doc.metadata.get('page', '?')}] {doc.page_content}"
+                for doc, _ in kept
+            ]
+            blob = "\n\n".join(contexts)
+            if len(_CONTEXT_TOKENIZER.encode(blob)) <= max_tokens or len(kept) == 1:
+                return blob, kept
+            kept = kept[:-1]  # drop the lowest-priority (last) chunk and retry
+        return "", []
+
+    def answer(self, owner_id: str, request: QueryRequest, byo_openai_key: str | None = None) -> QueryResponse:
+        # BYO key swaps the CHAT model only — embeddings/retrieval always use
+        # the default provider (self.embedding_provider, via
+        # _load_document_artifacts), never the caller's key. A document's
+        # vectors are permanently tied to whichever model/dimension indexed
+        # them, and the collection has one fixed vector size, so letting
+        # embeddings swap per-request would silently corrupt retrieval.
+        chat_provider: ChatProvider = OpenAIChatProvider(byo_openai_key) if byo_openai_key else self.chat_provider
+
+        vectorstore, bm25, chunks = self._load_document_artifacts(request.document_id, owner_id)
+
+        history = [dict(t) for t in db.list_chat_turns(request.document_id, owner_id)]
+        question = self._rewrite_query_if_needed(request.question, history, chat_provider)
 
         top_n = getattr(request, "top_k", None) or 5
 
         results = hybrid_retrieve(
-            query=request.question,
+            query=question,
             vectorstore=vectorstore,
             bm25=bm25,
             chunks=chunks,
@@ -188,15 +276,9 @@ class RAGService:
         # (A) expanded docs WITH scores — same set feeds prompt AND sources
         expanded = expand_with_neighbors_scored(results=results, chunks=chunks, window=1)
 
-        contexts = []
-        for doc, _ in expanded:
-            source = doc.metadata.get("source", "unknown")
-            page = doc.metadata.get("page", "?")
-            contexts.append(f"[Source: {source} | Page: {page}] {doc.page_content}")
-
-        context_blob = "\n\n".join(contexts)
-        prompt = self._build_prompt(request.question, context_blob)
-        answer = self._generate_answer(prompt)
+        context_blob, kept = self._build_context_blob(expanded, MAX_CONTEXT_TOKENS)
+        prompt = self._build_prompt(question, context_blob)
+        answer = self._generate_answer(prompt, chat_provider)
 
         sources = [
             SourceChunk(
@@ -206,15 +288,41 @@ class RAGService:
                 score=score,
                 content=doc.page_content,
             )
-            for doc, score in expanded
+            for doc, score in kept
         ]
+        db.create_chat_turn(
+            request.document_id, owner_id, request.question, answer,
+            json.dumps([s.model_dump() for s in sources]),
+        )
         return QueryResponse(
             request_id=str(uuid4()),
             answer=answer,
             sources=sources,
-            model=self.settings.openai_chat_model,
+            model=chat_provider.chat_model,
             collection_name=self.settings.qdrant_collection,
         )
+
+    def list_documents(self, owner_id: str) -> list[DocumentSummary]:
+        return [
+            DocumentSummary(
+                id=row["id"], filename=row["filename"], ingested_at=row["ingested_at"],
+                pages=row["pages"], chunks=row["chunks"], indexed_chunks=row["indexed_chunks"],
+            )
+            for row in db.list_documents(owner_id)
+        ]
+
+    def get_chat_history(self, document_id: str, owner_id: str) -> list[ChatTurnSummary]:
+        return [
+            ChatTurnSummary(
+                id=row["id"], question=row["question"], answer=row["answer"],
+                sources=[SourceChunk(**s) for s in json.loads(row["sources_json"] or "[]")],
+                created_at=row["created_at"],
+            )
+            for row in db.list_chat_turns(document_id, owner_id)
+        ]
+
+    def remove_document(self, document_id: str, owner_id: str) -> bool:
+        return db.delete_document(document_id, owner_id)
 
     def health(self) -> HealthStatus:
         qdrant_status = "down"
@@ -224,7 +332,7 @@ class RAGService:
         except Exception:
             qdrant_status = "down"
 
-        openai_status = "up" if self._check_openai() else "down"
+        openai_status = "up" if self._check_chat_provider() else "down"
 
         return HealthStatus(
             status="ok" if qdrant_status == "up" and openai_status == "up" else "degraded",
@@ -243,34 +351,20 @@ class RAGService:
             f"ANSWER:\n"
         )
 
-    def _check_openai(self) -> bool:
-        """Probe OpenAI reachability, cached for OPENAI_HEALTH_TTL seconds.
+    def _check_chat_provider(self) -> bool:
+        """Probe chat-provider reachability, cached for CHAT_HEALTH_TTL seconds.
 
         /health is polled frequently (container healthcheck, UI status badge). Without
-        caching, every poll costs a network round-trip to OpenAI — slow enough to trip
-        short client timeouts and make a healthy backend look unreachable.
+        caching, every poll costs a real completion call — slow enough to trip short
+        client timeouts and make a healthy backend look unreachable.
         """
-        if not self.settings.openai_api_key:
-            return False
-
         now = monotonic()
-        if self._openai_probe_at is not None and (now - self._openai_probe_at) < self.settings.openai_health_ttl:
-            return self._openai_probe_ok
+        if self._chat_probe_at is not None and (now - self._chat_probe_at) < self.settings.chat_health_ttl:
+            return self._chat_probe_ok
 
-        try:
-            self.openai_client.models.retrieve(self.settings.openai_chat_model)
-            self._openai_probe_ok = True
-        except Exception:
-            self._openai_probe_ok = False
+        self._chat_probe_ok = self.chat_provider.is_healthy()
+        self._chat_probe_at = now
+        return self._chat_probe_ok
 
-        self._openai_probe_at = now
-        return self._openai_probe_ok
-
-    def _generate_answer(self, prompt: str) -> str:
-        response = self.openai_client.chat.completions.create(
-            model=self.settings.openai_chat_model,
-            temperature=0,
-            max_tokens=512,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return response.choices[0].message.content or ""
+    def _generate_answer(self, prompt: str, chat_provider: ChatProvider) -> str:
+        return chat_provider.complete(prompt, max_tokens=512, temperature=0)

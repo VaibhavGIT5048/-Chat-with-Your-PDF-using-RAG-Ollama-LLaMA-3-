@@ -17,3 +17,9 @@ numpy
 aiofiles
 structlog
 tiktoken
+pyjwt
+bcrypt
+azure-communication-email
+httpx
+sentence-transformers
+slowapi

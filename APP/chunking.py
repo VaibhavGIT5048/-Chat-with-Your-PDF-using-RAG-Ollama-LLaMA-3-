@@ -3,9 +3,13 @@ import json
 from langchain_core.documents import Document
 from pathlib import Path
 
-from langchain_openai import OpenAIEmbeddings
+from APP.providers.embedding import as_langchain_embeddings, build_default_embedding_provider
 
-from APP.embedding import DEFAULT_EMBEDDING_MODEL
+# Semantic chunking embeds every sentence to find topic breakpoints. On the
+# self-hosted CPU model that is real wall-clock time proportional to document
+# length (it was a fast parallel API call back when this billed OpenAI), so
+# it's togglable — set SEMANTIC_CHUNKING=0 to force the recursive splitter.
+SEMANTIC_CHUNKING = os.getenv("SEMANTIC_CHUNKING", "1") not in ("0", "false", "False")
 
 try:
     from langchain_experimental.text_splitter import SemanticChunker
@@ -22,15 +26,15 @@ def chunk_documents(
     chunk_size: int = 1000,
     chunk_overlap: int = 150,
 ) -> list[Document]:
-    if SemanticChunker is not None:
+    if SemanticChunker is not None and SEMANTIC_CHUNKING:
         try:
-            emb = OpenAIEmbeddings(model=DEFAULT_EMBEDDING_MODEL, api_key=os.getenv("OPENAI_API_KEY"))
+            provider = build_default_embedding_provider()
             chunker = SemanticChunker(
-                embeddings=emb,
+                embeddings=as_langchain_embeddings(provider),
                 breakpoint_threshold_type="percentile",
             )
             chunks = chunker.split_documents(documents)
-            print(f"✅ Using SemanticChunker with {DEFAULT_EMBEDDING_MODEL} via OpenAI")
+            print(f"✅ Using SemanticChunker with self-hosted {getattr(provider, 'model_name', 'embedding model')}")
         except Exception as e:
             print(f"⚠️ SemanticChunker path failed: {e}; falling back to RecursiveCharacterTextSplitter")
             if RecursiveCharacterTextSplitter is None:

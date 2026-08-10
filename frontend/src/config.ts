@@ -18,6 +18,13 @@ export const REPO_URL =
 // opens devtools can read it. It stops drive-by hits, not a targeted one.
 export const SHARED_API_KEY = process.env.NEXT_PUBLIC_SHARED_API_KEY || ''
 
+// Header for an optional user-supplied OpenAI key (Phase 2's BYO-key path).
+// Stored client-side only (STORAGE_KEYS.byoOpenAiKey) and sent per-request —
+// never persisted server-side. Swaps the CHAT model only for that request;
+// embeddings always stay on the backend's default self-hosted model, since a
+// document's vectors are permanently tied to whichever model indexed them.
+export const BYO_OPENAI_KEY_HEADER = 'X-OpenAI-Api-Key'
+
 export const ROUTES = {
   health: '/health',
   ready: '/ready',
@@ -55,4 +62,5 @@ export const STORAGE_KEYS = {
   motion: 'rag.motion',
   pipelineOpen: 'rag.pipelineOpen',
   hasConnected: 'rag.hasConnected',
+  byoOpenAiKey: 'rag.byoOpenAiKey',
 } as const

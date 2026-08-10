@@ -26,17 +26,53 @@ services:
       - .env.docker
     environment:
       # Pulled from the project-root .env via Compose's built-in interpolation —
-      # only this one secret crosses over, so local-dev values in .env (e.g. a
-      # localhost QDRANT_URL) never leak in and shadow .env.docker's container values.
-      OPENAI_API_KEY: ${OPENAI_API_KEY:?Set OPENAI_API_KEY in your .env file}
+      # only these secrets cross over, so local-dev-only values in .env (e.g. a
+      # localhost QDRANT_URL) never leak in and shadow .env.docker's container
+      # values. OPENAI_API_KEY is optional now — RAGService constructs its
+      # OpenAI client lazily, so its absence no longer blocks startup, only the
+      # /ingest and /query calls that would actually need it (pre-Phase-2).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your .env file}
+      ACS_PRIMARY_CONNECTION_STRING: ${ACS_PRIMARY_CONNECTION_STRING:-}
+      ACS_SENDER_ADDRESS: ${ACS_SENDER_ADDRESS:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_MODEL: ${AZURE_OPENAI_MODEL:-}
+      # 1 = SemanticChunker on self-hosted bge-m3 (embeds every sentence on
+      # CPU); 0 = RecursiveCharacterTextSplitter.
+      #
+      # Measured on the same 44-page WEF PDF:
+      #   =1 -> 7m28s, 107 chunks, 68 passed the quality gate (64%)
+      #   =0 -> 1m31s, 169 chunks, 135 passed the quality gate (80%)
+      # So semantic chunking is ~4.9x slower AND scores worse on our own gate
+      # (its variable-size chunks fall outside the gate's 50-300 token window
+      # more often). Caveat: the gate is a heuristic, not a retrieval-quality
+      # measure, so this isn't proof semantic retrieval is worse — but there's
+      # no evidence here that it's better either.
+      #
+      # DEPLOYMENT GOTCHA: 7m28s exceeds Azure Container Apps' default ingress
+      # request timeout (~240s), so =1 would have /ingest severed mid-request
+      # on staging/prod even though it completes locally (Docker port-mapping
+      # imposes no such timeout). Set =0 there, or raise the ingress timeout.
+      SEMANTIC_CHUNKING: ${SEMANTIC_CHUNKING:-1}
     depends_on:
       qdrant:
         condition: service_healthy
     volumes:
-      - ./data/chunks:/home/appuser/app/data/chunks
-      - ./data/indexes:/home/appuser/app/data/indexes
-      - ./data/evals:/home/appuser/app/data/evals
-      - ./data/flashrank_cache:/home/appuser/app/data/flashrank_cache
+      # Single mount covering data/rag.db (SQLite metadata/auth store) and
+      # data/documents/{owner_id}/{document_id}/ (per-document BM25 pickles) —
+      # both new in Phase 1 — alongside the pre-existing chunks/indexes/evals/
+      # flashrank_cache subpaths, instead of enumerating each subpath by hand.
+      - ./data:/home/appuser/app/data
+      # Phase 2: bge-m3's ~2GB of weights download from Hugging Face on first
+      # use (lazy — only when /ingest or /query is actually called, not at
+      # startup). Without this mount, that download repeats on every
+      # container recreate; with it, it survives rebuilds.
+      - ./data/hf_cache:/home/appuser/.cache/huggingface
     networks:
       - rag-net
 

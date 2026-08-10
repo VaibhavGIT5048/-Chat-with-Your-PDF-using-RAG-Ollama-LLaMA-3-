@@ -8,7 +8,7 @@ import { useCallback, useEffect, useState, useRef } from 'react'
 import Link from 'next/link'
 import { Search } from 'lucide-react'
 
-import { API_BASE_URL } from '@/config'
+import { API_BASE_URL, STORAGE_KEYS } from '@/config'
 import { useActivity } from '@/hooks/useActivity'
 import { useHealth } from '@/hooks/useHealth'
 import { useToast } from '@/hooks/useToast'
@@ -58,6 +58,26 @@ export function WorkbenchView() {
   const [pipeStage, setPipeStage] = useState(-1)
   const [focus, setFocus] = useState<CitationFocus | null>(null)
   const [refreshToken, setRefreshToken] = useState(0)
+  const [byoKey, setByoKey] = useState('')
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEYS.byoOpenAiKey)
+      if (stored) setByoKey(stored)
+    } catch {
+      /* private browsing — falls back to session-only, unpersisted */
+    }
+  }, [])
+
+  const updateByoKey = useCallback((value: string) => {
+    setByoKey(value)
+    try {
+      if (value) localStorage.setItem(STORAGE_KEYS.byoOpenAiKey, value)
+      else localStorage.removeItem(STORAGE_KEYS.byoOpenAiKey)
+    } catch {
+      /* ignore */
+    }
+  }, [])
 
   const stageTimer = useRef<ReturnType<typeof setInterval> | null>(null)
   const typeTimer = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -123,7 +143,7 @@ export function WorkbenchView() {
     }, 620)
 
     try {
-      const result = await query(trimmed, topK)
+      const result = await query(trimmed, topK, byoKey || undefined)
       const sources = result.sources ?? []
       patchTurn(id, {
         pending: false,
@@ -157,7 +177,7 @@ export function WorkbenchView() {
       setQuerying(false)
       setBusy(null)
     }
-  }, [announce, clearTimers, flash, isConnected, patchTurn, question, querying, setBusy, startTyping, topK])
+  }, [announce, byoKey, clearTimers, flash, isConnected, patchTurn, question, querying, setBusy, startTyping, topK])
 
   const connected = isConnected
   const hasExistingIndex = Boolean(health?.collection_name)
@@ -312,6 +332,30 @@ export function WorkbenchView() {
             />
 
             <div className="p-5">
+              <div className="mb-3 flex flex-wrap items-center gap-2">
+                <label htmlFor="byo-openai-key" className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-55">
+                  Your OpenAI key (optional)
+                </label>
+                <input
+                  id="byo-openai-key"
+                  type="password"
+                  autoComplete="off"
+                  value={byoKey}
+                  onChange={(e) => updateByoKey(e.target.value)}
+                  placeholder="sk-… uses your own OpenAI billing for this answer"
+                  className="min-w-[260px] flex-1 px-[10px] py-[6px] text-[12.5px]"
+                  style={{
+                    color: 'var(--ink)',
+                    background: 'var(--chip-bg)',
+                    border: 'var(--brd-w) solid var(--brd)',
+                    borderRadius: 'var(--r-sm)',
+                  }}
+                />
+              </div>
+              <p className="mb-3 text-[11.5px] opacity-55">
+                Stored only in this browser and sent with this request — never saved on the backend. Leave blank to
+                use the default (Azure-hosted, billed to us).
+              </p>
               <textarea
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
