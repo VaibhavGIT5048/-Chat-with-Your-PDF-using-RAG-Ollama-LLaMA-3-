@@ -6,7 +6,6 @@ pydantic-settings
 python-dotenv
 pypdf
 langchain-core
-langchain-experimental
 langchain-text-splitters
 langchain-openai
 openai

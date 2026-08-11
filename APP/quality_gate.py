@@ -63,11 +63,37 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
 # ─────────────────────────────────────────────────────────────────────
 # THE REFINED QUALITY EVALUATOR
 # ─────────────────────────────────────────────────────────────────────
+def token_window_for(chunks: list[Document]) -> tuple[int, int]:
+    """Token window scaled to this document's own median chunk size.
+
+    A fixed 50-300 window silently encodes an assumption that chunks are
+    uniform, which is only true for fixed-size splitting: measured on a
+    44-page PDF, recursive chunks scored 80% against semantic chunks' 64%
+    purely because variable-size chunks fall outside a static window more
+    often. That penalised the chunker, not the chunks. Scaling to the median
+    keeps "is this chunk anomalously short or long *for this document*",
+    which is the thing actually worth scoring, and works for heading-bounded
+    sections whose size varies by design.
+
+    Falls back to the original constants when there's too little to measure.
+    """
+    counts = sorted(len(tokenizer.encode(c.page_content.strip())) for c in chunks if c.page_content.strip())
+    if len(counts) < 5:
+        return TOKEN_MIN, TOKEN_MAX
+    median = counts[len(counts) // 2]
+    if median <= 0:
+        return TOKEN_MIN, TOKEN_MAX
+    # Generous band: a chunk is only penalised when well outside the document's
+    # own norm, not for ordinary variation.
+    return max(20, int(median * 0.25)), max(int(median * 3), 60)
+
+
 def evaluate_chunk_refined(
     current_chunk: Document,
     previous_chunk: Document | None,
     current_vector: list[float] | None = None,
     previous_vector: list[float] | None = None,
+    token_window: tuple[int, int] | None = None,
 ) -> dict:
     text = current_chunk.page_content.strip()
     score = 0.0
@@ -83,9 +109,12 @@ def evaluate_chunk_refined(
         # features_passed silently get nothing for URL-filtered chunks.
         return {"total_score": 0.0, "features_passed": features, "metrics": {"url_filtered": True}}
 
-    # 1. X_T (Token Count)
+    # 1. X_T (Token Count) — window is per-document when supplied, so the
+    # score reflects "unusual for this document" rather than "unusual for a
+    # fixed-size splitter".
+    lo, hi = token_window if token_window is not None else (TOKEN_MIN, TOKEN_MAX)
     token_count = len(tokenizer.encode(text))
-    if TOKEN_MIN <= token_count <= TOKEN_MAX:
+    if lo <= token_count <= hi:
         features["X_T"] = 1
         score += (1 * W_TOKENS)
 
@@ -152,13 +181,15 @@ def apply_quality_gate(chunks: list[Document], threshold_score: float = 4.0, vec
     processed_chunks = []
     passed_count = 0
 
+    token_window = token_window_for(chunks)
     print(f"\n{'═'*60}\n RUNNING REFINED QUALITY GATE (Threshold: {threshold_score}/{MAX_SCORE})\n{'═'*60}")
+    print(f"Token window (per-doc)  : {token_window[0]}-{token_window[1]} tokens")
 
     previous_chunk = None
     previous_vector = None
     for i, chunk in enumerate(chunks):
         current_vector = vectors[i] if vectors is not None else None
-        evaluation = evaluate_chunk_refined(chunk, previous_chunk, current_vector, previous_vector)
+        evaluation = evaluate_chunk_refined(chunk, previous_chunk, current_vector, previous_vector, token_window)
 
         chunk.metadata["strict_score"] = evaluation["total_score"]
         chunk.metadata["passed_gate"] = evaluation["total_score"] >= threshold_score
@@ -173,7 +204,9 @@ def apply_quality_gate(chunks: list[Document], threshold_score: float = 4.0, vec
 
     print(f"Total Chunks Processed : {len(chunks)}")
     print(f"Passed (Status: True)  : {passed_count} chunks")
-    print(f"Dropped (Status: False): {len(chunks) - passed_count} chunks")
+    # Not dropped — every non-empty chunk is still indexed. Failing the gate
+    # only applies a 0.7 ranking multiplier in apply_quality_penalty().
+    print(f"Rank-penalised (0.7x)  : {len(chunks) - passed_count} chunks")
     return processed_chunks
 
 

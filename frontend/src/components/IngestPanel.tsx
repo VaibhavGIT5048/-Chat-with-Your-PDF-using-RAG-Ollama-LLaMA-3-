@@ -304,7 +304,7 @@ export function IngestPanel({ connected, hasExistingIndex, onIngested }: Props) 
                 ['Pages', stats.pages],
                 ['Chunks', stats.chunks],
                 ['Passed', stats.passed_chunks],
-                ['Dropped', stats.dropped_chunks],
+                ['Penalised', stats.penalised_chunks],
                 ['Indexed', stats.indexed_chunks],
               ].map(([k, v]) => (
                 <div key={k as string} className="px-[10px] py-3" style={{ background: 'var(--panel-solid)' }}>
@@ -326,9 +326,9 @@ export function IngestPanel({ connected, hasExistingIndex, onIngested }: Props) 
             </div>
             <div className="mt-[5px] flex justify-between text-[11.5px] opacity-60">
               <span>
-                {stats.passed_chunks} of {stats.chunks} passed the quality gate
+                {stats.passed_chunks} of {stats.chunks} passed the quality gate (all are indexed)
               </span>
-              <span>{stats.dropped_chunks} dropped</span>
+              <span>{stats.penalised_chunks} rank-penalised</span>
             </div>
           </div>
         )}

@@ -20,7 +20,7 @@ export interface IngestResponse {
   pages: number
   chunks: number
   passed_chunks: number
-  dropped_chunks: number
+  penalised_chunks: number
   indexed_chunks: number
 }
 

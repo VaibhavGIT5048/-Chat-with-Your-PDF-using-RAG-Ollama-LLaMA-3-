@@ -16,10 +16,11 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from APP import auth, db
+from APP import auth, db, jobs
 from APP import email as otp_email
 from APP.api_service import RAGService
 from APP.auth import get_current_user
+from APP.jobs import job_store
 from APP.schemas import (
     AuthTokenResponse,
     ChatTurnSummary,
@@ -28,6 +29,7 @@ from APP.schemas import (
     DocumentSummary,
     GoogleOAuthCallbackRequest,
     HealthStatus,
+    IngestJobStatus,
     IngestResponse,
     LoginRequest,
     OAuthCallbackRequest,
@@ -223,6 +225,65 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
         return response.model_copy(update={"request_id": getattr(request.state, "request_id", response.request_id)})
+
+    @app.post("/ingest/async", response_model=IngestJobStatus, status_code=202)
+    @limiter.limit(INGEST_RATE_LIMIT)
+    async def ingest_async(
+        request: Request,
+        file: UploadFile = File(...),
+        chunk_size: int = Form(1000),
+        chunk_overlap: int = Form(150),
+        quality_threshold: float = Form(4.0),
+        current_user=Depends(get_current_user),
+    ) -> IngestJobStatus:
+        """Non-blocking ingest: returns a job id immediately, poll
+        /ingest/jobs/{id} for the outcome.
+
+        POST /ingest stays synchronous and is still fine for ordinary
+        documents (a 44-page PDF is ~93s). This exists because ingest time
+        scales with document size while Azure Container Apps' ingress cuts
+        requests at ~240s, and Phase 3's parser router adds per-file OCR calls
+        on top — so large documents need a path that isn't bounded by an HTTP
+        timeout at all.
+        """
+        service = get_service(request)
+        payload = await file.read()
+        if not payload:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+
+        owner_id = current_user["id"]
+        filename = file.filename or "upload"
+        job = job_store.create(owner_id, filename)
+
+        def _run() -> None:
+            job_store.mark(job.id, jobs.RUNNING)
+            try:
+                result = service.ingest(
+                    owner_id=owner_id,
+                    filename=filename,
+                    raw_bytes=payload,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    quality_threshold=quality_threshold,
+                )
+                job_store.mark(job.id, jobs.SUCCEEDED, result=result.model_dump())
+            except Exception as exc:  # noqa: BLE001 — surfaced via job.error
+                logger.exception("ingest_job_failed", job_id=job.id)
+                job_store.mark(job.id, jobs.FAILED, error=str(exc))
+
+        # Fire-and-forget on a worker thread. Not awaited: the whole point is
+        # that the response returns before the work finishes.
+        asyncio.create_task(asyncio.to_thread(_run))
+        return IngestJobStatus(**job.to_dict())
+
+    @app.get("/ingest/jobs/{job_id}", response_model=IngestJobStatus)
+    async def ingest_job_status(job_id: str, current_user=Depends(get_current_user)) -> IngestJobStatus:
+        job = job_store.get(job_id, current_user["id"])
+        if job is None:
+            # Same 404 whether the job never existed or belongs to someone
+            # else, so a job id can't be probed to discover other users' work.
+            raise HTTPException(status_code=404, detail="Job not found")
+        return IngestJobStatus(**job.to_dict())
 
     @app.post("/query", response_model=QueryResponse)
     @limiter.limit(QUERY_RATE_LIMIT)

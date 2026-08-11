@@ -21,8 +21,23 @@ class IngestResponse(BaseModel):
     pages: int = 0
     chunks: int = 0
     passed_chunks: int = 0
-    dropped_chunks: int = 0
+    # NOT dropped from the index — every non-empty chunk is indexed. This
+    # counts chunks that scored below the quality threshold and therefore
+    # carry a 0.7 ranking multiplier at retrieval (apply_quality_penalty).
+    penalised_chunks: int = 0
     indexed_chunks: int = 0
+
+
+class IngestJobStatus(BaseModel):
+    """Status of an async ingest. `result` is the full IngestResponse
+    payload once status is "succeeded", None before that."""
+    job_id: str
+    status: str
+    filename: str
+    result: dict | None = None
+    error: str | None = None
+    created_at: float
+    updated_at: float
 
 
 class QueryRequest(BaseModel):

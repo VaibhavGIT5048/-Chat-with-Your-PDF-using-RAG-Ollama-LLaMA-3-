@@ -119,7 +119,7 @@ def main() -> None:
         stats = st.session_state.pipeline_stats
         st.info(
             f"Filename: {stats.get('filename')} | Pages: {stats.get('pages')} | Chunks: {stats.get('chunks')} | "
-            f"Passed: {stats.get('passed_chunks')} | Dropped: {stats.get('dropped_chunks')} | "
+            f"Passed: {stats.get('passed_chunks')} | Penalised: {stats.get('penalised_chunks')} | "
             f"Indexed: {stats.get('indexed_chunks')}"
         )
 

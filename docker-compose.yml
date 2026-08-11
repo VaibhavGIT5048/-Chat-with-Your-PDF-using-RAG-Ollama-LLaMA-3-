@@ -42,23 +42,19 @@ services:
       AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
       AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
       AZURE_OPENAI_MODEL: ${AZURE_OPENAI_MODEL:-}
-      # 1 = SemanticChunker on self-hosted bge-m3 (embeds every sentence on
-      # CPU); 0 = RecursiveCharacterTextSplitter.
+      # structure = split on the document's own headings (default, no model
+      # call); recursive = fixed-size character splitting (fallback).
       #
-      # Measured on the same 44-page WEF PDF:
-      #   =1 -> 7m28s, 107 chunks, 68 passed the quality gate (64%)
-      #   =0 -> 1m31s, 169 chunks, 135 passed the quality gate (80%)
-      # So semantic chunking is ~4.9x slower AND scores worse on our own gate
-      # (its variable-size chunks fall outside the gate's 50-300 token window
-      # more often). Caveat: the gate is a heuristic, not a retrieval-quality
-      # measure, so this isn't proof semantic retrieval is worse — but there's
-      # no evidence here that it's better either.
-      #
-      # DEPLOYMENT GOTCHA: 7m28s exceeds Azure Container Apps' default ingress
-      # request timeout (~240s), so =1 would have /ingest severed mid-request
-      # on staging/prod even though it completes locally (Docker port-mapping
-      # imposes no such timeout). Set =0 there, or raise the ingress timeout.
-      SEMANTIC_CHUNKING: ${SEMANTIC_CHUNKING:-1}
+      # Semantic chunking was removed after measuring it on a 44-page WEF PDF:
+      # 7m28s vs the recursive splitter's 1m31s, because it embedded every
+      # sentence on CPU to find topic breakpoints. It also exceeded Azure
+      # Container Apps' ~240s ingress timeout, so /ingest would have been cut
+      # off in a deployed environment while completing fine locally.
+      CHUNKING_STRATEGY: ${CHUNKING_STRATEGY:-structure}
+      # onnx = ONNX Runtime (faster on x86 via AVX512-VNNI); torch = PyTorch.
+      # Keep torch locally on arm64 where INT8 kernels don't apply; validate
+      # onnx on staging (x86) before making it the default.
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-torch}
     depends_on:
       qdrant:
         condition: service_healthy

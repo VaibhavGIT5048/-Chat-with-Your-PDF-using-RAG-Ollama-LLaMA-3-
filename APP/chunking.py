@@ -3,61 +3,58 @@ import json
 from langchain_core.documents import Document
 from pathlib import Path
 
-from APP.providers.embedding import as_langchain_embeddings, build_default_embedding_provider
+from APP.structure_chunking import structure_aware_split
 
-# Semantic chunking embeds every sentence to find topic breakpoints. On the
-# self-hosted CPU model that is real wall-clock time proportional to document
-# length (it was a fast parallel API call back when this billed OpenAI), so
-# it's togglable — set SEMANTIC_CHUNKING=0 to force the recursive splitter.
-SEMANTIC_CHUNKING = os.getenv("SEMANTIC_CHUNKING", "1") not in ("0", "false", "False")
-
-try:
-    from langchain_experimental.text_splitter import SemanticChunker
-except Exception:
-    SemanticChunker = None
+# structure = split on the document's own headings (default).
+# recursive = fixed-size character splitting, the fallback.
+#
+# Semantic chunking (LangChain's SemanticChunker) was removed: it embedded
+# every sentence to locate topic breakpoints, which cost 7m28s on a 44-page
+# PDF against the recursive splitter's 1m31s — and exceeded Azure Container
+# Apps' ~240s ingress timeout — for a retrieval benefit that was never
+# demonstrated. Headings already mark topic boundaries and cost no model call.
+CHUNKING_STRATEGY = os.getenv("CHUNKING_STRATEGY", "structure").strip().lower()
 
 try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 except Exception:
     RecursiveCharacterTextSplitter = None
 
-def chunk_documents(
-    documents: list[Document],
-    chunk_size: int = 1000,
-    chunk_overlap: int = 150,
-) -> list[Document]:
-    if SemanticChunker is not None and SEMANTIC_CHUNKING:
-        try:
-            provider = build_default_embedding_provider()
-            chunker = SemanticChunker(
-                embeddings=as_langchain_embeddings(provider),
-                breakpoint_threshold_type="percentile",
-            )
-            chunks = chunker.split_documents(documents)
-            print(f"✅ Using SemanticChunker with self-hosted {getattr(provider, 'model_name', 'embedding model')}")
-        except Exception as e:
-            print(f"⚠️ SemanticChunker path failed: {e}; falling back to RecursiveCharacterTextSplitter")
-            if RecursiveCharacterTextSplitter is None:
-                raise RuntimeError("No available text splitter found.")
-            splitter = RecursiveCharacterTextSplitter(
-                chunk_size=chunk_size,
-                chunk_overlap=chunk_overlap,
-                separators=["\n\n", "\n", ". ", " ", ""],
-                length_function=len,
-                is_separator_regex=False,
-            )
-            chunks = splitter.split_documents(documents)
-    else:
+
+def _recursive_splitter_factory(chunk_size: int, chunk_overlap: int):
+    def build():
         if RecursiveCharacterTextSplitter is None:
             raise RuntimeError("RecursiveCharacterTextSplitter not available; cannot chunk documents.")
-        splitter = RecursiveCharacterTextSplitter(
+        return RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
             separators=["\n\n", "\n", ". ", " ", ""],
             length_function=len,
             is_separator_regex=False,
         )
-        chunks = splitter.split_documents(documents)
+    return build
+
+
+def chunk_documents(
+    documents: list[Document],
+    chunk_size: int = 1000,
+    chunk_overlap: int = 150,
+) -> list[Document]:
+    factory = _recursive_splitter_factory(chunk_size, chunk_overlap)
+
+    if CHUNKING_STRATEGY == "structure":
+        chunks = structure_aware_split(documents, chunk_size, chunk_overlap, factory)
+        if chunks:
+            sectioned = sum(1 for c in chunks if c.metadata.get("section"))
+            print(f"✅ Structure-aware chunking: {len(chunks)} chunks, {sectioned} carry a section heading")
+        else:
+            # No headings found at all (e.g. a flat text dump) — the recursive
+            # splitter still produces usable chunks, so degrade rather than fail.
+            print("⚠️ Structure-aware chunking produced nothing; falling back to RecursiveCharacterTextSplitter")
+            chunks = factory().split_documents(documents)
+    else:
+        chunks = factory().split_documents(documents)
+        print(f"✅ Recursive character chunking: {len(chunks)} chunks")
 
     for i, chunk in enumerate(chunks):
         chunk.metadata["chunk_id"]   = i
@@ -66,11 +63,12 @@ def chunk_documents(
     sizes = [len(c.page_content) for c in chunks]
     print(f"✅ [Phase 2] Chunking Complete")
     print(f"   Total chunks : {len(chunks)}")
+    print(f"   Strategy     : {CHUNKING_STRATEGY}")
     print(f"   Chunk size   : {chunk_size} chars (overlap: {chunk_overlap})")
-    print(f"   Avg size     : {sum(sizes) // len(sizes)} chars")
-    print(f"   Min size     : {min(sizes)} chars")
-    print(f"   Max size     : {max(sizes)} chars")
-
+    if sizes:
+        print(f"   Avg size     : {sum(sizes) // len(sizes)} chars")
+        print(f"   Min size     : {min(sizes)} chars")
+        print(f"   Max size     : {max(sizes)} chars")
     return chunks
 
 
@@ -99,7 +97,10 @@ def show_overlap(chunks: list[Document], chunk_index: int = 0):
         print(f"\n✅ Overlapping text ({len(overlap_text)} chars):")
         print(f"  '{overlap_text[:150]}'")
     else:
-        print(f"\n⚠️  No overlap detected — check chunk_overlap setting")
+        # Structure-aware chunking splits on headings, so adjacent chunks are
+        # usually different sections with no overlap by design — only expect
+        # overlap within a section that the recursive splitter subdivided.
+        print(f"\n⚠️  No overlap detected — expected between sections, check chunk_overlap within one")
     print(f"\n{'═'*60}\n")
 
 
@@ -109,7 +110,8 @@ def preview_chunks(chunks: list[Document], n: int = 3):
     print(f"{'═'*60}")
     for chunk in chunks[:n]:
         m = chunk.metadata
-        print(f"\n── chunk_id={m['chunk_id']} | page={m['page']} | size={m['chunk_size']} chars ──")
+        section = f" | section={m['section']!r}" if m.get("section") else ""
+        print(f"\n── chunk_id={m['chunk_id']} | page={m.get('page')} | size={m['chunk_size']} chars{section} ──")
         print(chunk.page_content[:400])
         if m['chunk_size'] > 400:
             print(f"  ... [{m['chunk_size'] - 400} more chars]")
@@ -130,7 +132,6 @@ def save_chunks_jsonl(chunks: list[Document], output_path: str) -> None:
 
 if __name__ == "__main__":
     import argparse
-    from pathlib import Path
     from APP.pdf_loading import load_pdf
 
     def choose_pdf() -> Path:
