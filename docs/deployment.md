@@ -1,130 +1,118 @@
 # Deployment: dev and prod environments
 
-Two environments, both on Azure-issued hostnames. No custom domain.
-
-| | Backend (Container Apps) | Frontend (Static Web Apps) |
+| | dev (review) | prod (live) |
 |---|---|---|
-| **dev** | `rag-api-staging` | `grounded-rag-dev` |
-| **prod** | `rag-api` | `grounded-rag-prod` |
+| **Frontend** | `https://<owner>.github.io/private-rag-core/dev/` | `https://<owner>.github.io/private-rag-core/` |
+| **Backend** | `rag-api-staging` (Azure Container Apps) | `rag-api` (Azure Container Apps) |
+| **Built from** | `develop` | `main` |
 
-`develop` deploys to dev automatically. **Production is manual only** — promote
-via Actions → Run workflow → `target: production` (backend) / `prod`
-(frontend). Merging to `main` no longer ships anything on its own.
+Frontend is on **GitHub Pages**; backend is on **Azure Container Apps**.
+
+## How the two frontend URLs work
+
+GitHub Pages publishes exactly **one artifact per repository**, so both
+environments are produced in a single workflow run: it checks out `main` and
+`develop` separately, builds each with its own `BASE_PATH`
+(`/private-rag-core` and `/private-rag-core/dev`), and publishes them together.
+
+The consequence to understand: a push to `develop` *does* republish prod — but
+it rebuilds prod **from `main`**, so live content only changes when `main`
+changes. **Merging to `main` is the promotion step.** Nothing reaches prod
+merely because dev moved.
+
+The backend has no such constraint (two independent Container Apps), so there
+production is strictly manual: `develop` auto-deploys to `rag-api-staging`,
+and `rag-api` only moves via Actions → *Deploy backend to Azure* → Run
+workflow → `target: production`.
 
 ---
 
-## 1. Create the two Static Web Apps
+## 1. GitHub repo variables
 
-Free tier, `$0`. Run once, then note the hostname each command prints.
-
-```bash
-az login
-
-az staticwebapp create \
-  --name grounded-rag-dev \
-  --resource-group rag-api-rg \
-  --location centralindia \
-  --sku Free
-
-az staticwebapp create \
-  --name grounded-rag-prod \
-  --resource-group rag-api-rg \
-  --location centralindia \
-  --sku Free
-```
-
-Get the hostnames and deployment tokens:
-
-```bash
-for app in grounded-rag-dev grounded-rag-prod; do
-  echo "== $app =="
-  az staticwebapp show     --name $app -g rag-api-rg --query defaultHostname -o tsv
-  az staticwebapp secrets list --name $app -g rag-api-rg --query properties.apiKey -o tsv
-done
-```
-
-Azure generates the hostname (e.g. `calm-sand-0a1b2c3d.azurestaticapps.net`) —
-you don't choose it, so everything below has to be filled in *after* this step.
-
-## 2. GitHub repo configuration
-
-**Secrets** (Settings → Secrets and variables → Actions → Secrets):
-
-| Secret | Value |
-|---|---|
-| `AZURE_SWA_TOKEN_DEV` | deployment token for `grounded-rag-dev` |
-| `AZURE_SWA_TOKEN_PROD` | deployment token for `grounded-rag-prod` |
-
-**Variables** (same page → Variables tab). Include the scheme, no trailing slash:
+Settings → Secrets and variables → Actions → **Variables**. Include the
+scheme, no trailing slash:
 
 | Variable | Value |
 |---|---|
-| `DEV_SITE_URL` | `https://<dev-swa-hostname>` |
-| `PROD_SITE_URL` | `https://<prod-swa-hostname>` |
 | `DEV_API_BASE_URL` | `https://rag-api-staging.<...>.azurecontainerapps.io` |
 | `PROD_API_BASE_URL` | `https://rag-api.<...>.azurecontainerapps.io` |
 
-Backend FQDNs:
+Get the backend FQDNs:
 
 ```bash
+az login
 for app in rag-api-staging rag-api; do
   az containerapp show -n $app -g rag-api-rg \
     --query properties.configuration.ingress.fqdn -o tsv
 done
 ```
 
-## 3. Backend CORS — do this before testing sign-in
+Pages must be set to **GitHub Actions** as its source (Settings → Pages →
+Build and deployment → Source), not "Deploy from a branch".
 
-The browser calls the API from the Static Web App origin, so each backend must
-allow its own frontend. Missing this produces a CORS failure that looks
-exactly like a broken API.
+## 2. Backend CORS — do this before testing sign-in
+
+The browser calls the API from the Pages origin. Both environments share the
+*same* origin (`https://<owner>.github.io`) because they differ only by path,
+and CORS is origin-based — paths are not part of an origin. So each backend
+allows that one origin:
 
 ```bash
 az containerapp update -n rag-api-staging -g rag-api-rg \
-  --set-env-vars CORS_ALLOWED_ORIGINS="https://<dev-swa-hostname>,http://localhost:3000"
+  --set-env-vars CORS_ALLOWED_ORIGINS="https://<owner>.github.io,http://localhost:3000"
 
 az containerapp update -n rag-api -g rag-api-rg \
-  --set-env-vars CORS_ALLOWED_ORIGINS="https://<prod-swa-hostname>"
+  --set-env-vars CORS_ALLOWED_ORIGINS="https://<owner>.github.io"
 ```
 
-`localhost:3000` stays on dev only, so local work keeps talking to the dev API.
+Note this means CORS alone cannot keep the dev site off the prod API — the
+separation comes from each build being compiled with its own
+`NEXT_PUBLIC_API_BASE_URL`, not from the browser refusing the call.
 
-## 4. OAuth — sign-in breaks the moment the origin changes
+`localhost:3000` stays on dev only, so local work talks to the dev backend.
 
-OAuth providers only redirect to registered URLs. New frontend hostnames mean
-every callback registration is now wrong, and the failure is at the provider's
-consent screen (`redirect_uri_mismatch`), before any of our code runs.
+## 3. OAuth — sign-in breaks the moment a redirect URL is wrong
+
+Providers only redirect to **registered** URLs. Because dev and prod are
+different *paths* on the same host, they need different callback URLs:
+
+```
+prod  https://<owner>.github.io/private-rag-core/auth/callback/
+dev   https://<owner>.github.io/private-rag-core/dev/auth/callback/
+```
+
+A mismatch fails at the provider's consent screen with
+`redirect_uri_mismatch`, before any of our code runs.
 
 **GitHub** — one callback URL per OAuth App, which is why there are two apps
 (<https://github.com/settings/developers>):
 
 | App | Homepage | Authorization callback URL |
 |---|---|---|
-| dev | `https://<dev-swa-hostname>` | `https://<dev-swa-hostname>/auth/callback/` |
-| prod | `https://<prod-swa-hostname>` | `https://<prod-swa-hostname>/auth/callback/` |
+| prod | `https://<owner>.github.io/private-rag-core/` | `https://<owner>.github.io/private-rag-core/auth/callback/` |
+| dev | `https://<owner>.github.io/private-rag-core/dev/` | `https://<owner>.github.io/private-rag-core/dev/auth/callback/` |
 
-Local development keeps using the **dev** app, so add
-`http://localhost:3000/auth/callback/` there if you still need it — GitHub
-allows only one, so pick per how you're working.
+Local development also uses the **dev** app, and GitHub permits only one
+callback per app — so swap in `http://localhost:3000/auth/callback/` while
+working locally, or register a third app for it.
 
-**Google** — one client, multiple redirect URIs
-(<https://console.cloud.google.com/apis/credentials> → your OAuth client →
+**Google** — one client takes several redirect URIs
+(<https://console.cloud.google.com/apis/credentials> → OAuth client →
 Authorised redirect URIs):
 
 ```
-https://<dev-swa-hostname>/auth/callback/
-https://<prod-swa-hostname>/auth/callback/
+https://<owner>.github.io/private-rag-core/auth/callback/
+https://<owner>.github.io/private-rag-core/dev/auth/callback/
 http://localhost:3000/auth/callback/
 ```
 
-Then make sure each backend has the matching credentials as Container App
-secrets — dev uses the dev GitHub app's pair, prod uses the prod app's:
-`GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GOOGLE_CLIENT_ID`,
-`GOOGLE_CLIENT_SECRET`.
+Each backend needs the credentials matching its own frontend — dev uses the
+dev GitHub app's pair, prod uses the prod app's: `GITHUB_CLIENT_ID`,
+`GITHUB_CLIENT_SECRET`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`.
 
-## 5. Remaining backend secrets
+## 4. Remaining backend secrets
 
-From the local `.env`, which is the reconciled source of truth:
+From the local `.env` (the reconciled source of truth):
 
 ```bash
 az containerapp update -n rag-api-staging -g rag-api-rg --set-env-vars \
@@ -136,32 +124,33 @@ az containerapp update -n rag-api-staging -g rag-api-rg --set-env-vars \
   AZURE_OPENAI_MODEL="gpt-5-mini"
 ```
 
-Without the `AZURE_OPENAI_*` trio, `/health` reports `degraded` and the
-deploy workflow's own smoke test fails the run.
+Without the `AZURE_OPENAI_*` trio, `/health` reports `degraded` and the deploy
+workflow's own smoke test fails the run.
 
-Use a **different** `JWT_SECRET_KEY` for prod than dev: sharing it means a
+Use a **different `JWT_SECRET_KEY` for prod than dev** — sharing it means a
 token minted on dev is accepted by production.
 
-## 6. Verify
+## 5. Verify
 
 ```bash
-curl -s https://<dev-api-fqdn>/health          # expect "status":"ok"
-curl -s -o /dev/null -w "%{http_code}\n" https://<dev-swa-hostname>   # expect 200
+curl -s https://<dev-api-fqdn>/health      # expect "status":"ok"
+curl -s -o /dev/null -w "%{http_code}\n" https://<owner>.github.io/private-rag-core/
+curl -s -o /dev/null -w "%{http_code}\n" https://<owner>.github.io/private-rag-core/dev/
 ```
 
-Then sign in on the dev site with GitHub, Google, and email/OTP. Sign-in is
-the thing most likely to be misconfigured, because it depends on all three of
-CORS, the callback registrations, and the backend secrets agreeing.
+Then sign in on the **dev** site with GitHub, Google, and email/OTP. Sign-in
+is the most likely thing to be misconfigured, since it needs CORS, the
+callback registrations, and the backend secrets to all agree.
 
 ## Notes
 
 - **`EMBEDDING_BACKEND=onnx` is unvalidated.** INT8 gains depend on
-  AVX512-VNNI, which is x86-only — the dev Mac is arm64, so it can only be
-  benchmarked meaningfully on Container Apps. Try it on dev first; it falls
+  AVX512-VNNI (x86-only); the dev Mac is arm64, so it can only be benchmarked
+  meaningfully on Container Apps. Try it on `rag-api-staging` first — it falls
   back to torch automatically if the ONNX artifact won't load.
-- **Ingest**: `POST /ingest` is synchronous (~93s for 44 pages) and fits
-  inside the ~240s ingress timeout. Use `POST /ingest/async` + `GET
-  /ingest/jobs/{id}` for anything larger.
+- **Ingest**: `POST /ingest` is synchronous (~93s for 44 pages), inside the
+  ~240s ingress timeout. Use `POST /ingest/async` + `GET /ingest/jobs/{id}`
+  for larger documents.
 - **OTP email lands in spam** from the `*.azurecomm.net` managed domain, which
   Microsoft documents as testing-only. Accepted deliberately to avoid buying a
   domain; the Phase 4 verify-email page carries "check your spam folder" copy.
