@@ -162,6 +162,7 @@ export function LandingView() {
           >
             Illustrative view of the backend pipeline — not measured telemetry.
           </span>
+          <span className="text-[12px] font-extrabold opacity-65">Hover a stage for a plain-language explanation.</span>
         </div>
         <div ref={pipeRef} className="mt-7">
           <PipelineVisualiser stage={stage} />

@@ -49,7 +49,7 @@ export function PipelineVisualiser({ stage, className = '' }: Props) {
   }
 
   return (
-    <div className={className}>
+    <div className={`relative ${className}`}>
       <svg
         viewBox="0 0 940 740"
         style={{ width: '100%', height: 'auto', display: 'block', overflow: 'visible' }}
@@ -95,6 +95,7 @@ export function PipelineVisualiser({ stage, className = '' }: Props) {
                 transformOrigin: 'center',
               }}
             >
+              <title>{node.detail ?? node.label}</title>
               <rect
                 x={node.x}
                 y={node.y}
@@ -122,37 +123,34 @@ export function PipelineVisualiser({ stage, className = '' }: Props) {
           )
         })}
 
-        {hoveredNode?.detail && (() => {
-          const position = tooltipPosition(hoveredNode)
-          return (
-            <foreignObject
-              x={position.x}
-              y={position.y}
-              width="276"
-              height="106"
-              style={{ pointerEvents: 'none', overflow: 'visible' }}
-            >
-              <div
-                className="anim-rise p-3"
-                style={{
-                  color: 'var(--ink)',
-                  background: 'var(--panel-solid)',
-                  border: 'var(--brd-w) solid var(--accent)',
-                  borderRadius: 'var(--r-sm)',
-                  boxShadow: 'var(--shadow)',
-                  fontSize: 12,
-                  lineHeight: 1.45,
-                }}
-              >
-                <div style={{ color: 'var(--accent)', fontSize: 10, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase', marginBottom: 5 }}>
-                  {hoveredNode.label}
-                </div>
-                {hoveredNode.detail}
-              </div>
-            </foreignObject>
-          )
-        })()}
       </svg>
+
+      {hoveredNode?.detail && (() => {
+        const position = tooltipPosition(hoveredNode)
+        return (
+          <div
+            role="tooltip"
+            className="anim-rise pointer-events-none absolute z-20 p-3"
+            style={{
+              left: `${(position.x / 940) * 100}%`,
+              top: `${(position.y / 740) * 100}%`,
+              width: 'min(276px, calc(100% - 24px))',
+              color: 'var(--ink)',
+              background: 'var(--panel-solid)',
+              border: 'var(--brd-w) solid var(--accent)',
+              borderRadius: 'var(--r-sm)',
+              boxShadow: 'var(--shadow)',
+              fontSize: 12,
+              lineHeight: 1.45,
+            }}
+          >
+            <div style={{ color: 'var(--accent)', fontSize: 10, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase', marginBottom: 5 }}>
+              {hoveredNode.label}
+            </div>
+            {hoveredNode.detail}
+          </div>
+        )
+      })()}
     </div>
   )
 }
