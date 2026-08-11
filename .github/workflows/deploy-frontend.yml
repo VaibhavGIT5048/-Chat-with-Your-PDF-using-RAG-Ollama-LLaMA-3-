@@ -65,6 +65,13 @@ jobs:
           NEXT_PUBLIC_API_BASE_URL: ${{ vars.PROD_API_BASE_URL || vars.NEXT_PUBLIC_API_BASE_URL }}
           NEXT_PUBLIC_SITE_URL: https://${{ github.repository_owner }}.github.io/private-rag-core
           BASE_PATH: /private-rag-core
+          # GitHub OAuth Apps allow exactly one callback URL each, which is why
+          # there are separate PROD/DEV apps — so unlike the API URL, this is
+          # NOT the same value in both builds.
+          NEXT_PUBLIC_GITHUB_CLIENT_ID: ${{ vars.PROD_GITHUB_CLIENT_ID }}
+          # One Google client, many redirect URIs, so the same ID is correct
+          # in both builds.
+          NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
         run: |
           npm ci
           npm run build
@@ -77,6 +84,8 @@ jobs:
           # Nested base path is what gives dev its own URL under the same
           # Pages site; every asset URL depends on this being right.
           BASE_PATH: /private-rag-core/dev
+          NEXT_PUBLIC_GITHUB_CLIENT_ID: ${{ vars.DEV_GITHUB_CLIENT_ID }}
+          NEXT_PUBLIC_GOOGLE_CLIENT_ID: ${{ vars.GOOGLE_CLIENT_ID }}
         run: |
           npm ci
           npm run build
