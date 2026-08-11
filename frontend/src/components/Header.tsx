@@ -16,6 +16,7 @@ import { useUiPrefs, type Motion } from '@/hooks/useUiPrefs'
 import { downloadReadme } from '@/lib/readme'
 import { Button, Spinner } from '@/components/ui'
 import { StatusBadge } from '@/components/StatusBadge'
+import { BrandMark } from '@/components/BrandMark'
 
 const NAV = [
   { href: '/', label: 'Overview' },
@@ -59,10 +60,7 @@ export function Header() {
         }}
       >
         <Link href="/" className="flex items-center gap-[10px]" style={{ color: 'var(--ink)' }}>
-          <span
-            className="block h-[22px] w-[22px]"
-            style={{ background: 'var(--accent)', borderRadius: 'var(--r-sm)' }}
-          />
+          <BrandMark size={28} />
           <span className="text-[15px] font-extrabold tracking-[-0.02em]">
             GROUNDED<span style={{ color: 'var(--accent)' }}>·</span>RAG
           </span>

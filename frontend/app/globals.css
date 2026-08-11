@@ -176,6 +176,48 @@ a:hover {
   }
 }
 
+@keyframes grounded-mark-float {
+  0%, 100% { transform: translateY(-7px); }
+  55% { transform: translateY(0); }
+}
+
+@keyframes grounded-mark-halo {
+  0%, 100% { opacity: .3; transform: scale(.94) rotate(0deg); }
+  50% { opacity: .8; transform: scale(1.04) rotate(18deg); }
+}
+
+.brand-mark__answer {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: grounded-mark-float 2.8s cubic-bezier(.3,1.4,.4,1) infinite;
+}
+
+.brand-mark__halo {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: grounded-mark-halo 2.8s ease-in-out infinite;
+}
+
+.brand-mark__connector {
+  opacity: .55;
+  animation: grounded-mark-connector 2.8s ease-in-out infinite;
+}
+
+@keyframes grounded-mark-connector {
+  0%, 100% { opacity: .28; }
+  55% { opacity: 1; }
+}
+
+.brand-mark__citation {
+  transform-origin: 85px 93px;
+  animation: grounded-mark-citation 2.8s ease-in-out infinite;
+}
+
+@keyframes grounded-mark-citation {
+  0%, 48% { opacity: 0; transform: scale(.7); }
+  62%, 100% { opacity: 1; transform: scale(1); }
+}
+
 .anim-rise {
   animation: rise 0.3s ease both;
 }

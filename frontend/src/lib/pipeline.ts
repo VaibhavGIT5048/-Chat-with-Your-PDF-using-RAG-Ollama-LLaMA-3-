@@ -24,16 +24,16 @@ export interface PipeEdge {
 export const PIPE_NODES: PipeNode[] = [
   { id: 'q', stage: 0, x: 360, y: 6, w: 220, h: 42, label: 'Question' },
   { id: 'guard', stage: 1, x: 360, y: 70, w: 220, h: 42, label: 'JWT + prompt guardrails' },
-  { id: 'rewrite', stage: 2, x: 360, y: 134, w: 220, h: 42, label: 'Query rewrite', sub: 'resolve recent chat context' },
+  { id: 'rewrite', stage: 2, x: 360, y: 134, w: 220, h: 42, label: 'Query rewrite' },
   { id: 'dense', stage: 3, x: 30, y: 216, w: 300, h: 50, label: 'Dense · bge-m3 embedding' },
   { id: 'sparse', stage: 3, x: 610, y: 216, w: 300, h: 50, label: 'Sparse · BM25 keywords' },
-  { id: 'qdrant', stage: 4, x: 30, y: 290, w: 300, h: 50, label: 'Qdrant filtered search', sub: 'owner + document scope' },
+  { id: 'qdrant', stage: 4, x: 30, y: 290, w: 300, h: 50, label: 'Qdrant filtered search' },
   { id: 'rrf', stage: 5, x: 320, y: 372, w: 300, h: 58, label: 'Reciprocal Rank Fusion', sub: 'dense 0.65 / sparse 0.35' },
   { id: 'gate', stage: 6, x: 320, y: 456, w: 300, h: 44, label: 'Chunk quality-gate weighting' },
   { id: 'rank', stage: 7, x: 320, y: 526, w: 300, h: 44, label: 'Flashrank reranker → top-K' },
   { id: 'neigh', stage: 8, x: 320, y: 596, w: 300, h: 44, label: 'Neighbour context expansion ±1' },
   { id: 'gen', stage: 9, x: 320, y: 666, w: 300, h: 48, label: 'gpt-5-mini → cited answer' },
-  { id: 'parser', stage: 2, x: 670, y: 134, w: 240, h: 42, label: 'Parser router', sub: 'ingest: OCR / Office / CSV' },
+  { id: 'parser', stage: 2, x: 670, y: 134, w: 240, h: 42, label: 'Parser router' },
 ]
 
 export const PIPE_EDGES: PipeEdge[] = [
