@@ -53,6 +53,7 @@ export function StatusBadge() {
         tabIndex={0}
         role="status"
         aria-live="polite"
+        aria-expanded={open}
         onFocus={() => setOpen(true)}
         onBlur={() => setOpen(false)}
         className="flex cursor-default items-center gap-2 px-[11px] py-[6px]"
@@ -78,7 +79,7 @@ export function StatusBadge() {
 
       {open && (
         <div
-          className="anim-rise absolute right-0 top-[42px] w-[266px] p-[14px]"
+          className="anim-rise absolute right-0 top-[42px] z-50 w-[min(360px,calc(100vw-24px))] max-w-[calc(100vw-24px)] overflow-hidden p-[14px]"
           style={{
             background: 'var(--panel-solid)',
             border: 'var(--brd-w) solid var(--brd)',
@@ -89,23 +90,23 @@ export function StatusBadge() {
           <div className="mb-2 text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-55">
             Backend subsystems
           </div>
-          <div className="grid gap-[6px] text-[13px]">
-            <div className="flex justify-between">
+          <div className="grid gap-[8px] text-[13px]">
+            <div className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-4">
               <span>Qdrant</span>
-              <span className="tnum font-extrabold">{health?.qdrant ?? 'unknown'}</span>
+              <span className="tnum min-w-0 break-words text-right font-extrabold">{health?.qdrant ?? 'unknown'}</span>
             </div>
-            <div className="flex justify-between">
+            <div className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-4">
               <span>OpenAI</span>
-              <span className="tnum font-extrabold">{health?.openai ?? 'unknown'}</span>
+              <span className="tnum min-w-0 break-words text-right font-extrabold">{health?.openai ?? 'unknown'}</span>
             </div>
-            <div className="flex justify-between">
+            <div className="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-4">
               <span>Collection</span>
-              <span className="font-extrabold">{health?.collection_name ?? '—'}</span>
+              <span className="min-w-0 break-all text-right font-extrabold">{health?.collection_name ?? '—'}</span>
             </div>
           </div>
           <div className="my-3" style={{ height: 'var(--brd-w)', background: 'var(--brd)' }} />
-          <div className="text-[12px] leading-[1.5] opacity-60">
-            Polling <span className="font-extrabold">{API_BASE_URL}</span>/health · attempt{' '}
+          <div className="min-w-0 text-[12px] leading-[1.5] opacity-60">
+            Polling <span className="break-all font-extrabold">{API_BASE_URL}/health</span> · attempt{' '}
             {attempts}
           </div>
         </div>
