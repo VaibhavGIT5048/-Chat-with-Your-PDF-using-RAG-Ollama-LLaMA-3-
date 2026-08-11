@@ -10,7 +10,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 
-import { MAX_PIPE_STAGE, PIPE_EDGES, PIPE_NODES } from '@/lib/pipeline'
+import { MAX_PIPE_STAGE, PIPE_EDGES, PIPE_NODES, type PipeNode } from '@/lib/pipeline'
 import { useUiPrefs } from '@/hooks/useUiPrefs'
 
 interface Props {
