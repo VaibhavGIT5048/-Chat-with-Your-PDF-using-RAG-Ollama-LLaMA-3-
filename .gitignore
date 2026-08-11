@@ -1,0 +1,18 @@
+node_modules/
+.env
+.DS_Store
+# No trailing slash on .venv/data: on this machine both are SYMLINKS pointing
+# outside ~/Documents (macOS iCloud "Optimize Storage" was evicting their
+# contents, which hung Python imports and broke Docker bind mounts with
+# EDEADLK). Git treats a symlink as a file, so a "dir/" pattern would NOT
+# match it and the link would get committed as a broken machine-specific path.
+.venv
+.venv*/
+venv/
+__pycache__/
+**/__pycache__/
+**/*.pyc
+.vscode/
+data
+*.pdf
+RG=*.yml

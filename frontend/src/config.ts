@@ -1,0 +1,92 @@
+// Single source of truth for anything environment- or endpoint-shaped.
+// Pointing the app at a different backend must only require changing
+// NEXT_PUBLIC_API_BASE_URL — nothing here is duplicated elsewhere.
+
+export const API_BASE_URL =
+  process.env.NEXT_PUBLIC_API_BASE_URL?.replace(/\/+$/, '') || 'http://localhost:8000'
+
+export const SITE_URL =
+  process.env.NEXT_PUBLIC_SITE_URL?.replace(/\/+$/, '') ||
+  'https://vaibhavgit5048.github.io/private-rag-core'
+
+export const REPO_URL =
+  'https://github.com/VaibhavGIT5048/private-rag-core'
+
+// OAuth client IDs are public by design — they identify the app to the
+// provider and appear in the redirect URL anyway. The *secrets* live only on
+// the backend, which is what performs the code-for-token exchange.
+export const GITHUB_CLIENT_ID = process.env.NEXT_PUBLIC_GITHUB_CLIENT_ID || ''
+export const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID || ''
+
+// Must match exactly what is registered with GitHub and Google — a trailing
+// slash difference is enough to fail with redirect_uri_mismatch. Derived from
+// SITE_URL so dev and prod each get their own without extra configuration.
+export const AUTH_CALLBACK_URL = `${SITE_URL}/auth/callback/`
+
+// Header for an optional user-supplied OpenAI key. Stored client-side only and
+// sent per request — never persisted server-side. Swaps the CHAT model only;
+// embeddings always stay on the backend's default, since a document's vectors
+// are permanently tied to whichever model indexed them.
+export const BYO_OPENAI_KEY_HEADER = 'X-OpenAI-Api-Key'
+
+export const ROUTES = {
+  health: '/health',
+  ready: '/ready',
+  ingest: '/ingest',
+  ingestAsync: '/ingest/async',
+  ingestJob: (id: string) => `/ingest/jobs/${encodeURIComponent(id)}`,
+  query: '/query',
+  collections: '/collections',
+  collection: (name: string) => `/collections/${encodeURIComponent(name)}`,
+  documents: '/documents',
+  document: (id: string) => `/documents/${encodeURIComponent(id)}`,
+  documentHistory: (id: string) => `/documents/${encodeURIComponent(id)}/history`,
+  authGithub: '/auth/github/callback',
+  authGoogle: '/auth/google/callback',
+  authSignup: '/auth/signup',
+  authVerifyOtp: '/auth/verify-otp',
+  authResendOtp: '/auth/resend-otp',
+  authLogin: '/auth/login',
+} as const
+
+// /health is cheap (server-side cached) but crosses the network; ingest runs one
+// embedding call per chunk and legitimately takes minutes on a real PDF.
+export const TIMEOUTS = {
+  health: 8_000,
+  auth: 30_000,
+  query: 120_000,
+  ingest: 600_000,
+} as const
+
+// Faster cadence on /setup, where the visitor is explicitly waiting for the stack.
+export const POLL_MS = {
+  setup: 5_000,
+  other: 20_000,
+} as const
+
+export const INGEST_DEFAULTS = {
+  chunkSize: 1000,
+  chunkOverlap: 150,
+  qualityThreshold: 4.0,
+  topK: 4,
+} as const
+
+// Mirrors the backend parser router's supported extensions.
+export const ACCEPTED_EXTENSIONS = [
+  '.pdf', '.txt', '.md', '.csv', '.json',
+  '.docx', '.pptx', '.xlsx',
+  '.png', '.jpg', '.jpeg', '.webp',
+] as const
+
+export const STORAGE_KEYS = {
+  theme: 'rag.theme',
+  motion: 'rag.motion',
+  pipelineOpen: 'rag.pipelineOpen',
+  hasConnected: 'rag.hasConnected',
+  byoOpenAiKey: 'rag.byoOpenAiKey',
+  jwt: 'rag.jwt',
+  user: 'rag.user',
+  // Which provider started an OAuth round-trip, checked against the `state`
+  // returned by the provider to defend against CSRF.
+  oauthState: 'rag.oauthState',
+} as const

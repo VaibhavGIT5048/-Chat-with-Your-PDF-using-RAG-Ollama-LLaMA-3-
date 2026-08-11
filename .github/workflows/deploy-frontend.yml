@@ -1,0 +1,124 @@
+name: Deploy frontend to GitHub Pages
+
+# Two environments, one Pages site:
+#   prod (live)  https://<owner>.github.io/private-rag-core/       <- built from main
+#   dev  (review) https://<owner>.github.io/private-rag-core/dev/  <- built from develop
+#
+# GitHub Pages publishes exactly ONE artifact per repository, so both
+# environments have to be produced in the same run — you cannot update one
+# without republishing the other. That is why this workflow checks out both
+# branches and builds each from its own source: prod always reflects `main`
+# and dev always reflects `develop`, whichever branch triggered the run.
+#
+# Consequence worth understanding: a push to develop does republish prod, but
+# it rebuilds prod *from main*, so the live content only changes when main
+# changes. Merging to main is the promotion step — nothing ships to prod
+# merely because dev moved.
+#
+# Each environment points at its own backend (Azure Container Apps):
+#   dev  -> rag-api-staging     prod -> rag-api
+# See docs/deployment.md.
+
+on:
+  push:
+    branches: [develop]
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/deploy-frontend.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  PAGES_BASE: /private-rag-core
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main (prod source)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: prod-src
+
+      - name: Checkout develop (dev source)
+        uses: actions/checkout@v4
+        with:
+          ref: develop
+          path: dev-src
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build prod bundle (from main)
+        working-directory: prod-src/frontend
+        env:
+          NEXT_PUBLIC_API_BASE_URL: ${{ vars.PROD_API_BASE_URL || vars.NEXT_PUBLIC_API_BASE_URL }}
+          NEXT_PUBLIC_SITE_URL: https://${{ github.repository_owner }}.github.io/private-rag-core
+          BASE_PATH: /private-rag-core
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build dev bundle (from develop)
+        working-directory: dev-src/frontend
+        env:
+          NEXT_PUBLIC_API_BASE_URL: ${{ vars.DEV_API_BASE_URL }}
+          NEXT_PUBLIC_SITE_URL: https://${{ github.repository_owner }}.github.io/private-rag-core/dev
+          # Nested base path is what gives dev its own URL under the same
+          # Pages site; every asset URL depends on this being right.
+          BASE_PATH: /private-rag-core/dev
+        run: |
+          npm ci
+          npm run build
+
+      - name: Assemble the Pages site
+        run: |
+          mkdir -p site
+          cp -r prod-src/frontend/out/. site/
+          mkdir -p site/dev
+          cp -r dev-src/frontend/out/. site/dev/
+          # .nojekyll stops Pages' Jekyll pass from dropping _next/ — the
+          # directory holding every JS and CSS asset Next.js emits.
+          touch site/.nojekyll
+          echo "--- top level ---"; ls site | head
+          echo "--- dev ---"; ls site/dev | head
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Smoke test both environments
+        # A green deploy step doesn't prove either URL actually serves.
+        run: |
+          BASE="https://${{ github.repository_owner }}.github.io/private-rag-core"
+          for url in "$BASE/" "$BASE/dev/"; do
+            ok=""
+            for i in $(seq 1 20); do
+              CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$url" || echo "000")
+              if [ "$CODE" = "200" ]; then echo "OK  $url (attempt $i)"; ok=1; break; fi
+              sleep 10
+            done
+            [ -n "$ok" ] || { echo "::error::$url never returned 200"; exit 1; }
+          done

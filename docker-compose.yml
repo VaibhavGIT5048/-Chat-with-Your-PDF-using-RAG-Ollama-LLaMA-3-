@@ -1,0 +1,95 @@
+services:
+  qdrant:
+    image: qdrant/qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - rag-net
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.docker
+    environment:
+      # Pulled from the project-root .env via Compose's built-in interpolation —
+      # only these secrets cross over, so local-dev-only values in .env (e.g. a
+      # localhost QDRANT_URL) never leak in and shadow .env.docker's container
+      # values. OPENAI_API_KEY is optional now — RAGService constructs its
+      # OpenAI client lazily, so its absence no longer blocks startup, only the
+      # /ingest and /query calls that would actually need it (pre-Phase-2).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in your .env file}
+      ACS_PRIMARY_CONNECTION_STRING: ${ACS_PRIMARY_CONNECTION_STRING:-}
+      ACS_SENDER_ADDRESS: ${ACS_SENDER_ADDRESS:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_MODEL: ${AZURE_OPENAI_MODEL:-}
+      # structure = split on the document's own headings (default, no model
+      # call); recursive = fixed-size character splitting (fallback).
+      #
+      # Semantic chunking was removed after measuring it on a 44-page WEF PDF:
+      # 7m28s vs the recursive splitter's 1m31s, because it embedded every
+      # sentence on CPU to find topic breakpoints. It also exceeded Azure
+      # Container Apps' ~240s ingress timeout, so /ingest would have been cut
+      # off in a deployed environment while completing fine locally.
+      CHUNKING_STRATEGY: ${CHUNKING_STRATEGY:-structure}
+      # onnx = ONNX Runtime (faster on x86 via AVX512-VNNI); torch = PyTorch.
+      # Keep torch locally on arm64 where INT8 kernels don't apply; validate
+      # onnx on staging (x86) before making it the default.
+      EMBEDDING_BACKEND: ${EMBEDDING_BACKEND:-torch}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      # Single mount covering data/rag.db (SQLite metadata/auth store) and
+      # data/documents/{owner_id}/{document_id}/ (per-document BM25 pickles) —
+      # both new in Phase 1 — alongside the pre-existing chunks/indexes/evals/
+      # flashrank_cache subpaths, instead of enumerating each subpath by hand.
+      - ./data:/home/appuser/app/data
+      # Phase 2: bge-m3's ~2GB of weights download from Hugging Face on first
+      # use (lazy — only when /ingest or /query is actually called, not at
+      # startup). Without this mount, that download repeats on every
+      # container recreate; with it, it survives rebuilds.
+      - ./data/hf_cache:/home/appuser/.cache/huggingface
+    networks:
+      - rag-net
+
+  frontend:
+    image: private-rag-core-frontend:latest
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+      args:
+        BASE_PATH: ""
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-https://vaibhavgit5048.github.io/private-rag-core/}
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    networks:
+      - rag-net
+
+networks:
+  rag-net:
+    driver: bridge
+
+volumes:
+  qdrant_storage:

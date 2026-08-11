@@ -1,0 +1,211 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ─────────────────────────────────────────────────────────────
+   Two complete identities, switched by data-theme on <html>.
+   Nightglass: dark, blurred glass, soft radii, aurora on.
+   Modernist:  light, hard 2px rules, zero radii, no blur.
+   ───────────────────────────────────────────────────────────── */
+
+:root,
+:root[data-theme='nightglass'] {
+  --bg: #0a0b0f;
+  --ink: #edeef2;
+  --accent: #7c83ff;
+  --accent-hi: #a5aaff;
+  --on-accent: #07080c;
+  --panel: rgba(255, 255, 255, 0.045);
+  --panel-solid: #13141b;
+  --panel-hi: rgba(255, 255, 255, 0.09);
+  --chip-bg: rgba(255, 255, 255, 0.06);
+  --brd: rgba(255, 255, 255, 0.14);
+  --brd-w: 1px;
+  --r-sm: 10px;
+  --blur: blur(18px);
+  --grain: 0.05;
+  --aurora: 0.3;
+  --spot: 0.5;
+  --head-bg: rgba(10, 11, 15, 0.72);
+  --head-shadow: 0 1px 0 rgba(255, 255, 255, 0.06);
+  --shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  --warn-bg: rgba(124, 131, 255, 0.14);
+  --ok: #22c55e;
+  --warn: #f59e0b;
+}
+
+:root[data-theme='modernist'] {
+  --bg: #f3f2f2;
+  --ink: #201e1d;
+  --accent: #ec3013;
+  --accent-hi: #ae1800;
+  --on-accent: #f3f2f2;
+  --panel: #eae9e9;
+  --panel-solid: #f8f4f4;
+  --panel-hi: #e0dede;
+  --chip-bg: #f8f4f4;
+  --brd: rgba(32, 30, 29, 0.4);
+  --brd-w: 2px;
+  --r-sm: 0px;
+  --blur: none;
+  --grain: 0.035;
+  --aurora: 0;
+  --spot: 0.18;
+  --head-bg: rgba(243, 242, 242, 0.9);
+  --head-shadow: none;
+  --shadow: 0 12px 32px rgba(45, 43, 43, 0.22);
+  --warn-bg: #ffe0d9;
+  --ok: #15803d;
+  --warn: #b45309;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+body {
+  overflow-x: hidden;
+  font-feature-settings: 'tnum' 0;
+}
+
+a {
+  color: var(--accent-hi);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--accent);
+}
+
+/* Visible focus for keyboard users on every interactive element. */
+:where(button, a, input, textarea, select, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Clamp long chunk text until expanded. */
+.clamp-3 {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* ── Keyframes ───────────────────────────────────────────────── */
+@keyframes dash {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes breathe {
+  0%,
+  100% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.035);
+  }
+}
+@keyframes dotpulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.72);
+  }
+}
+@keyframes ringout {
+  0% {
+    transform: scale(0.6);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}
+@keyframes shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+@keyframes drift {
+  0% {
+    transform: rotate(0deg) scale(1.4);
+  }
+  100% {
+    transform: rotate(360deg) scale(1.4);
+  }
+}
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes caret {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+
+.anim-rise {
+  animation: rise 0.3s ease both;
+}
+.anim-spin {
+  animation: spin 0.9s linear infinite;
+}
+.anim-caret {
+  animation: caret 1s step-end infinite;
+}
+
+/* Motion=off kills every decorative animation and transition outright, so the
+   app is fully usable for anyone who asked not to see movement. */
+:root[data-motion='off'] *,
+:root[data-motion='off'] *::before,
+:root[data-motion='off'] *::after {
+  animation: none !important;
+  transition: none !important;
+}
+
+/* Reduced trims the ambient/infinite effects but keeps discrete feedback. */
+:root[data-motion='reduced'] .ambient {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
