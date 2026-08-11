@@ -73,6 +73,14 @@ const FEATURES = [
   { t: 'RAGAS harness', d: 'Faithfulness and relevancy measured offline, not guessed at.' },
 ]
 
+const SECURITY = [
+  ['Account-scoped access', 'JWT authentication is required for ingest, query, documents, and chat history.'],
+  ['Document isolation', 'Every vector search is filtered by the signed-in owner and selected document.'],
+  ['Untrusted-data boundary', 'Document text is context, never instructions; guardrails keep retrieved content from steering the system.'],
+  ['Abuse controls', 'Per-user rate limits protect the expensive ingest and query paths.'],
+  ['Key handling', 'The optional BYO OpenAI key is sent in a request header and is never persisted by the backend.'],
+]
+
 export function LandingView() {
   const { motionOff } = useUiPrefs()
   const { ref: pipeRef, stage } = useLoopingStage(!motionOff)
@@ -157,6 +165,25 @@ export function LandingView() {
         </div>
         <div ref={pipeRef} className="mt-7">
           <PipelineVisualiser stage={stage} />
+        </div>
+      </section>
+
+      <section className="mx-auto max-w-[1180px] px-[26px] pb-[90px]">
+        <Rule className="mb-10" />
+        <div className="mb-7 flex flex-wrap items-baseline gap-4">
+          <h2 className="m-0 text-[38px] font-extrabold tracking-[-0.03em]">Security by default</h2>
+          <span className="text-[12px] opacity-55">The boundaries around the pipeline matter as much as the models.</span>
+        </div>
+        <div
+          className="grid grid-cols-[repeat(auto-fit,minmax(230px,1fr))]"
+          style={{ gap: 'var(--brd-w)', background: 'var(--brd)' }}
+        >
+          {SECURITY.map(([title, detail]) => (
+            <div key={title} className="p-6" style={{ background: 'var(--panel)', backdropFilter: 'var(--blur)' }}>
+              <div className="mb-2 text-[16px] font-extrabold">{title}</div>
+              <div className="text-[13px] leading-[1.55] opacity-65">{detail}</div>
+            </div>
+          ))}
         </div>
       </section>
 

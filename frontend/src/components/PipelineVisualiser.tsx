@@ -21,6 +21,32 @@ interface Props {
 
 export function PipelineVisualiser({ stage, className = '' }: Props) {
   const { motionOff, motionFull } = useUiPrefs()
+  const [hovered, setHovered] = useState<string | null>(null)
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const showAfterDelay = (id: string) => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current)
+    hoverTimer.current = setTimeout(() => setHovered(id), 360)
+  }
+
+  const hideTooltip = () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current)
+    hoverTimer.current = null
+    setHovered(null)
+  }
+
+  useEffect(() => () => {
+    if (hoverTimer.current) clearTimeout(hoverTimer.current)
+  }, [])
+
+  const hoveredNode = PIPE_NODES.find((node) => node.id === hovered)
+
+  function tooltipPosition(node: PipeNode) {
+    const width = 276
+    const x = node.x >= 600 ? Math.max(14, node.x - width - 16) : node.x + node.w + 16
+    const y = node.y > 590 ? node.y - 108 : node.y + node.h + 12
+    return { x: Math.min(x, 940 - width - 14), y }
+  }
 
   return (
     <div className={className}>
@@ -55,9 +81,15 @@ export function PipelineVisualiser({ stage, className = '' }: Props) {
           return (
             <g
               key={node.id}
+              tabIndex={0}
+              onMouseEnter={() => showAfterDelay(node.id)}
+              onMouseLeave={hideTooltip}
+              onFocus={() => showAfterDelay(node.id)}
+              onBlur={hideTooltip}
               style={{
                 opacity: on ? 1 : 0.5,
                 transition: 'opacity .3s',
+                cursor: node.detail ? 'help' : 'default',
                 animation: current && !motionOff ? 'breathe 1.2s ease-in-out infinite' : 'none',
                 transformBox: 'fill-box',
                 transformOrigin: 'center',
@@ -84,16 +116,42 @@ export function PipelineVisualiser({ stage, className = '' }: Props) {
                   <div className="text-[15px] font-extrabold leading-[1.15] tracking-[-0.01em]">
                     {node.label}
                   </div>
-                  {node.sub && (
-                    <div className="font-mono text-[11.5px] leading-[1.2] opacity-60">
-                      {node.sub}
-                    </div>
-                  )}
                 </div>
               </foreignObject>
             </g>
           )
         })}
+
+        {hoveredNode?.detail && (() => {
+          const position = tooltipPosition(hoveredNode)
+          return (
+            <foreignObject
+              x={position.x}
+              y={position.y}
+              width="276"
+              height="106"
+              style={{ pointerEvents: 'none', overflow: 'visible' }}
+            >
+              <div
+                className="anim-rise p-3"
+                style={{
+                  color: 'var(--ink)',
+                  background: 'var(--panel-solid)',
+                  border: 'var(--brd-w) solid var(--accent)',
+                  borderRadius: 'var(--r-sm)',
+                  boxShadow: 'var(--shadow)',
+                  fontSize: 12,
+                  lineHeight: 1.45,
+                }}
+              >
+                <div style={{ color: 'var(--accent)', fontSize: 10, fontWeight: 800, letterSpacing: '.12em', textTransform: 'uppercase', marginBottom: 5 }}>
+                  {hoveredNode.label}
+                </div>
+                {hoveredNode.detail}
+              </div>
+            </foreignObject>
+          )
+        })()}
       </svg>
     </div>
   )
