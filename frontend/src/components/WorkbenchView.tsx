@@ -6,8 +6,9 @@
 
 import { useCallback, useEffect, useState, useRef } from 'react'
 import Link from 'next/link'
-import { Search } from 'lucide-react'
+import { ChevronRight, Search } from 'lucide-react'
 import { useRouter, useSearchParams } from 'next/navigation'
+import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 
 import { API_BASE_URL, STORAGE_KEYS } from '@/config'
 import { useActivity } from '@/hooks/useActivity'
@@ -15,7 +16,15 @@ import { useRequireAuth } from '@/hooks/useAuth'
 import { useHealth } from '@/hooks/useHealth'
 import { useToast } from '@/hooks/useToast'
 import { useUiPrefs } from '@/hooks/useUiPrefs'
-import { formatScore, maxScore, matchSourceIndices, parseAnswer, scoreBarPercent } from '@/lib/citations'
+import {
+  CITE_SCHEME,
+  formatScore,
+  maxScore,
+  matchSourceIndices,
+  parseCitationHref,
+  scoreBarPercent,
+  toMarkdownWithCitationLinks,
+} from '@/lib/citations'
 import { MAX_PIPE_STAGE, QUERY_STAGES } from '@/lib/pipeline'
 import { ApiError, getChatHistory, query } from '@/services/api'
 import type { ChatTurnSummary, IngestResponse, SourceChunk } from '@/types/api'
@@ -35,6 +44,9 @@ interface Turn {
   requestId?: string
   error?: string
   errorTitle?: string
+  /** Collapsed by default — several expanded source cards per turn drowns
+   *  out the answer itself. Clicking a citation forces this open. */
+  sourcesOpen?: boolean
 }
 
 interface CitationFocus {
@@ -166,6 +178,19 @@ export function WorkbenchView() {
     setTranscript((current) => current.map((turn) => (turn.id === id ? { ...turn, ...patch } : turn)))
   }, [])
 
+  // Focusing a citation highlights one source card, so the dropdown holding
+  // that card has to open too — otherwise the highlight lands inside a
+  // collapsed panel and the click appears to do nothing.
+  const focusCitation = useCallback(
+    (turnId: string, source: string, page: string) => {
+      const alreadyFocused =
+        focus?.turnId === turnId && focus.source === source && focus.page === page
+      setFocus(alreadyFocused ? null : { turnId, source, page })
+      if (!alreadyFocused) patchTurn(turnId, { sourcesOpen: true })
+    },
+    [focus, patchTurn],
+  )
+
   const submitQuery = useCallback(async () => {
     const trimmed = question.trim()
     if (!trimmed || querying || !isConnected) return
@@ -233,9 +258,9 @@ export function WorkbenchView() {
   const emptyTranscript = transcript.length === 0
 
   const renderAnswer = (turn: Turn) => {
-    const visibleAnswer =
-      turn.id === latestId && turn.answer && typed < turn.answer.length ? turn.answer.slice(0, typed) : turn.answer ?? ''
-    const parts = parseAnswer(visibleAnswer)
+    const full = turn.answer ?? ''
+    const stillTyping = turn.id === latestId && Boolean(full) && typed < full.length
+    const visibleAnswer = stillTyping ? full.slice(0, typed) : full
 
     return (
       <div className="space-y-3">
@@ -245,41 +270,59 @@ export function WorkbenchView() {
           <Mono className="text-[11.5px]">request {turn.requestId?.slice(0, 8) ?? '—'}</Mono>
         </div>
 
-        <div className="text-[15px] leading-[1.7]">
-          {parts.map((part, index) => {
-            if (part.kind === 'text') {
-              return <span key={`${turn.id}-text-${index}`}>{part.text}</span>
-            }
-
-            const active = focus?.turnId === turn.id && focus.source === part.source && focus.page === part.page
-            return (
-              <button
-                key={`${turn.id}-citation-${index}`}
-                type="button"
-                onClick={() =>
-                  setFocus((current) =>
-                    active ? null : { turnId: turn.id, source: part.source, page: part.page },
+        {/* Answers are Markdown. Citations are rewritten to links on a `cite:`
+            scheme first, so one parse covers the whole answer — splitting the
+            string around citations breaks any list item or bold run they sit
+            inside. The `a` override swaps those links back for chips. */}
+        <div
+          className="answer-prose text-[15px] leading-[1.7]"
+          data-typing={stillTyping ? 'true' : 'false'}
+        >
+          <ReactMarkdown
+            // react-markdown strips any protocol outside its safe list, which
+            // would blank out every `cite:` href and lose the citations. Pass
+            // those through untouched; everything else keeps the default
+            // sanitising so a link in a document can't smuggle in javascript:.
+            urlTransform={(url) => (url.startsWith(CITE_SCHEME) ? url : defaultUrlTransform(url))}
+            components={{
+              // `node` is react-markdown's AST handle — destructured out so it
+              // never reaches the DOM, which would warn on an unknown attribute.
+              a: ({ href, children, node, ...props }) => {
+                const cite = href ? parseCitationHref(href) : null
+                if (!cite) {
+                  return (
+                    <a href={href} target="_blank" rel="noopener noreferrer" {...props}>
+                      {children}
+                    </a>
                   )
                 }
-                className="mx-[3px] inline-flex items-center rounded-[var(--r-sm)] border px-2 py-[2px] text-[12.5px] font-extrabold transition-transform"
-                style={{
-                  verticalAlign: '1px',
-                  borderColor: 'var(--accent)',
-                  background: active
-                    ? 'var(--accent)'
-                    : 'color-mix(in srgb, var(--accent) 12%, transparent)',
-                  color: active ? 'var(--on-accent)' : 'var(--accent-hi)',
-                }}
-              >
-                {part.source} · p{part.page}
-              </button>
-            )
-          })}
-          {turn.id === latestId && turn.answer && typed < turn.answer.length && (
-            <span className="ml-1 inline-block align-baseline text-[16px]" style={{ animation: 'caret 1s step-end infinite' }}>
-              |
-            </span>
-          )}
+
+                const active =
+                  focus?.turnId === turn.id && focus.source === cite.source && focus.page === cite.page
+                return (
+                  <button
+                    type="button"
+                    data-citation=""
+                    aria-pressed={active}
+                    onClick={() => focusCitation(turn.id, cite.source, cite.page)}
+                    className="mx-[3px] inline-flex items-center rounded-[var(--r-sm)] border px-2 py-[2px] text-[12.5px] font-extrabold transition-transform"
+                    style={{
+                      verticalAlign: '1px',
+                      borderColor: 'var(--accent)',
+                      background: active
+                        ? 'var(--accent)'
+                        : 'color-mix(in srgb, var(--accent) 12%, transparent)',
+                      color: active ? 'var(--on-accent)' : 'var(--accent-hi)',
+                    }}
+                  >
+                    {cite.source} · p{cite.page}
+                  </button>
+                )
+              },
+            }}
+          >
+            {toMarkdownWithCitationLinks(visibleAnswer)}
+          </ReactMarkdown>
         </div>
       </div>
     )
@@ -489,11 +532,6 @@ export function WorkbenchView() {
                 const sourceMax = maxScore(turn.sources)
                 const focusedIndices =
                   focus?.turnId === turn.id ? matchSourceIndices(turn.sources, focus.source, focus.page) : []
-                const typedAnswer =
-                  turn.id === latestId && turn.answer && typed < turn.answer.length
-                    ? turn.answer.slice(0, typed)
-                    : turn.answer ?? ''
-                const parts = turn.pending || turn.error ? [] : parseAnswer(typedAnswer)
 
                 return (
                   <Panel key={turn.id}>
@@ -523,62 +561,90 @@ export function WorkbenchView() {
                           {renderAnswer(turn)}
 
                           <div>
-                            <div className="mb-3 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
-                              Sources {turn.sources.length ? `(${turn.sources.length})` : ''}
-                            </div>
-
                             {turn.sources.length === 0 ? (
-                              <div className="text-[13px] opacity-60">The backend returned no sources for this answer.</div>
+                              <>
+                                <div className="mb-3 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
+                                  Sources
+                                </div>
+                                <div className="text-[13px] opacity-60">The backend returned no sources for this answer.</div>
+                              </>
                             ) : (
-                              <div className="grid gap-3">
-                                {turn.sources.map((source, index) => {
-                                  const focused = focusedIndices.includes(index)
-                                  return (
-                                    <button
-                                      key={`${turn.id}-${index}`}
-                                      type="button"
-                                      onClick={() =>
-                                        setFocus((current) =>
-                                          current?.turnId === turn.id && current.source === source.source && current.page === String(source.page ?? '—')
-                                            ? null
-                                            : { turnId: turn.id, source: source.source, page: String(source.page ?? '—') },
-                                        )
-                                      }
-                                      className="grid gap-3 text-left transition-transform"
-                                      style={{
-                                        padding: '16px',
-                                        background: focused ? 'color-mix(in srgb, var(--accent) 10%, var(--panel-solid))' : 'var(--panel-solid)',
-                                        border: `var(--brd-w) solid ${focused ? 'var(--accent)' : 'var(--brd)'}`,
-                                        transform: focused ? 'translateY(-1px)' : 'none',
-                                      }}
-                                    >
-                                      <div className="flex flex-wrap items-baseline justify-between gap-3">
-                                        <div className="text-[14px] font-extrabold">{source.source}</div>
-                                        <div className="flex flex-wrap gap-3 text-[11px] font-extrabold uppercase tracking-[0.08em] opacity-55">
-                                          <span>{source.page ?? 'page —'}</span>
-                                          <span>chunk {source.chunk_id ?? '—'}</span>
-                                          <span>score {formatScore(source.score)}</span>
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => patchTurn(turn.id, { sourcesOpen: !turn.sourcesOpen })}
+                                  aria-expanded={Boolean(turn.sourcesOpen)}
+                                  aria-controls={`sources-${turn.id}`}
+                                  className="mb-3 flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55 hover:opacity-90"
+                                >
+                                  <ChevronRight
+                                    size={13}
+                                    aria-hidden
+                                    style={{
+                                      transform: turn.sourcesOpen ? 'rotate(90deg)' : 'none',
+                                      transition: 'transform .18s ease',
+                                    }}
+                                  />
+                                  Sources ({turn.sources.length})
+                                </button>
+
+                                {/* Toggled by class, not the `hidden` attribute: Tailwind's
+                                    `.grid` utility sits in a later layer than preflight's
+                                    `[hidden]` rule at equal specificity, so it would win and
+                                    the collapsed panel would stay on screen. */}
+                                <div
+                                  id={`sources-${turn.id}`}
+                                  className={turn.sourcesOpen ? 'grid gap-3' : 'hidden'}
+                                >
+                                  {turn.sources.map((source, index) => {
+                                    const focused = focusedIndices.includes(index)
+                                    return (
+                                      <button
+                                        key={`${turn.id}-${index}`}
+                                        type="button"
+                                        onClick={() =>
+                                          setFocus((current) =>
+                                            current?.turnId === turn.id && current.source === source.source && current.page === String(source.page ?? '—')
+                                              ? null
+                                              : { turnId: turn.id, source: source.source, page: String(source.page ?? '—') },
+                                          )
+                                        }
+                                        className="grid gap-3 text-left transition-transform"
+                                        style={{
+                                          padding: '16px',
+                                          background: focused ? 'color-mix(in srgb, var(--accent) 10%, var(--panel-solid))' : 'var(--panel-solid)',
+                                          border: `var(--brd-w) solid ${focused ? 'var(--accent)' : 'var(--brd)'}`,
+                                          transform: focused ? 'translateY(-1px)' : 'none',
+                                        }}
+                                      >
+                                        <div className="flex flex-wrap items-baseline justify-between gap-3">
+                                          <div className="text-[14px] font-extrabold">{source.source}</div>
+                                          <div className="flex flex-wrap gap-3 text-[11px] font-extrabold uppercase tracking-[0.08em] opacity-55">
+                                            <span>{source.page ?? 'page —'}</span>
+                                            <span>chunk {source.chunk_id ?? '—'}</span>
+                                            <span>score {formatScore(source.score)}</span>
+                                          </div>
                                         </div>
-                                      </div>
 
-                                      <div className="h-[6px] overflow-hidden" style={{ background: 'var(--brd)' }}>
-                                        <span
-                                          className="block h-full"
-                                          style={{
-                                            width: scoreBarPercent(source.score, sourceMax),
-                                            background: 'var(--accent)',
-                                            transition: 'width .9s cubic-bezier(.2,.8,.2,1)',
-                                          }}
-                                        />
-                                      </div>
+                                        <div className="h-[6px] overflow-hidden" style={{ background: 'var(--brd)' }}>
+                                          <span
+                                            className="block h-full"
+                                            style={{
+                                              width: scoreBarPercent(source.score, sourceMax),
+                                              background: 'var(--accent)',
+                                              transition: 'width .9s cubic-bezier(.2,.8,.2,1)',
+                                            }}
+                                          />
+                                        </div>
 
-                                      <div className="text-[13px] leading-[1.6] opacity-78">
-                                        {source.content || 'No excerpt returned.'}
-                                      </div>
-                                    </button>
-                                  )
-                                })}
-                              </div>
+                                        <div className="text-[13px] leading-[1.6] opacity-78">
+                                          {source.content || 'No excerpt returned.'}
+                                        </div>
+                                      </button>
+                                    )
+                                  })}
+                                </div>
+                              </>
                             )}
                           </div>
                         </div>

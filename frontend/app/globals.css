@@ -228,6 +228,88 @@ a:hover {
   animation: caret 1s step-end infinite;
 }
 
+/* Answers arrive as Markdown. Before this, the raw string was dumped into a
+   span, so `**bold**` and `- item` showed up as literal punctuation. These
+   rules style the parsed output using the existing tokens only — no new
+   colours, nothing that looks different from the rest of the page. */
+.answer-prose > *:first-child {
+  margin-top: 0;
+}
+.answer-prose > *:last-child {
+  margin-bottom: 0;
+}
+.answer-prose p,
+.answer-prose ul,
+.answer-prose ol,
+.answer-prose blockquote,
+.answer-prose pre {
+  margin: 0 0 0.85em;
+}
+.answer-prose h1,
+.answer-prose h2,
+.answer-prose h3,
+.answer-prose h4 {
+  margin: 1.25em 0 0.5em;
+  font-weight: 800;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+}
+.answer-prose h1 { font-size: 1.3em; }
+.answer-prose h2 { font-size: 1.18em; }
+.answer-prose h3 { font-size: 1.06em; }
+.answer-prose h4 { font-size: 1em; text-transform: uppercase; letter-spacing: 0.08em; opacity: 0.7; }
+.answer-prose ul,
+.answer-prose ol {
+  padding-left: 1.35em;
+}
+.answer-prose ul { list-style: disc; }
+.answer-prose ol { list-style: decimal; }
+.answer-prose li { margin: 0.25em 0; }
+.answer-prose li::marker { color: var(--accent); }
+.answer-prose strong { font-weight: 800; }
+.answer-prose em { font-style: italic; }
+.answer-prose blockquote {
+  padding-left: 0.9em;
+  border-left: var(--brd-w) solid var(--accent);
+  opacity: 0.85;
+}
+.answer-prose code {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.9em;
+  padding: 0.1em 0.35em;
+  border-radius: var(--r-sm);
+  background: var(--chip-bg);
+}
+.answer-prose pre {
+  padding: 12px 14px;
+  border-radius: var(--r-sm);
+  background: var(--chip-bg);
+  border: var(--brd-w) solid var(--brd);
+  /* Long code lines scroll inside the block instead of widening the page. */
+  overflow-x: auto;
+}
+.answer-prose pre code {
+  padding: 0;
+  background: none;
+}
+.answer-prose hr {
+  margin: 1.1em 0;
+  border: 0;
+  border-top: var(--brd-w) solid var(--brd);
+}
+.answer-prose a:not([data-citation]) {
+  color: var(--accent-hi);
+  text-decoration: underline;
+}
+/* The typing animation reveals characters progressively. Anchoring the caret
+   to the last rendered block keeps it at the end of the text, where an
+   element appended after the Markdown output would drop to its own line. */
+.answer-prose[data-typing='true'] > *:last-child::after {
+  content: '|';
+  margin-left: 2px;
+  animation: caret 1s step-end infinite;
+}
+
 /* Motion=off kills every decorative animation and transition outright, so the
    app is fully usable for anyone who asked not to see movement. */
 :root[data-motion='off'] *,

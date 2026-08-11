@@ -6,31 +6,6 @@ import type { SourceChunk } from '@/types/api'
 
 const CITATION_RE = /\[Source:\s*([^|\]]+?)\s*\|\s*Page:\s*([^\]]+?)\s*\]/g
 
-export type AnswerPart =
-  | { kind: 'text'; text: string }
-  | { kind: 'citation'; source: string; page: string; raw: string }
-
-export function parseAnswer(answer: string): AnswerPart[] {
-  const parts: AnswerPart[] = []
-  let cursor = 0
-
-  // Fresh lastIndex each call — the regex is module-scoped and stateful.
-  CITATION_RE.lastIndex = 0
-  let match: RegExpExecArray | null
-  while ((match = CITATION_RE.exec(answer)) !== null) {
-    if (match.index > cursor) {
-      parts.push({ kind: 'text', text: answer.slice(cursor, match.index) })
-    }
-    parts.push({ kind: 'citation', source: match[1], page: match[2], raw: match[0] })
-    cursor = match.index + match[0].length
-  }
-
-  if (cursor < answer.length) {
-    parts.push({ kind: 'text', text: answer.slice(cursor) })
-  }
-  return parts
-}
-
 /**
  * Find which source cards a citation refers to. Page is compared as a string
  * because the API types it as `number | string | null`.
@@ -94,11 +69,25 @@ export const CITE_SCHEME = 'cite:'
  * A link is valid Markdown anywhere inline, so the structure survives and the
  * renderer swaps it back for a chip.
  */
+/**
+ * `encodeURIComponent` leaves parentheses alone, but an unescaped `)` closes
+ * a Markdown link early — so `report(final).pdf` would cut the href in half
+ * and render the tail as stray text. Percent-encode them too.
+ */
+function encodeCitePart(value: string): string {
+  return encodeURIComponent(value).replace(/\(/g, '%28').replace(/\)/g, '%29')
+}
+
+/** Square brackets in a filename would likewise break the link's label. */
+function escapeLinkText(value: string): string {
+  return value.replace(/[\\[\]]/g, (char) => `\\${char}`)
+}
+
 export function toMarkdownWithCitationLinks(answer: string): string {
   CITATION_RE.lastIndex = 0
   return answer.replace(CITATION_RE, (_full, source: string, page: string) => {
-    const label = `${source.trim()} · p${page.trim()}`
-    const href = `${CITE_SCHEME}${encodeURIComponent(source.trim())}::${encodeURIComponent(page.trim())}`
+    const label = escapeLinkText(`${source.trim()} · p${page.trim()}`)
+    const href = `${CITE_SCHEME}${encodeCitePart(source.trim())}::${encodeCitePart(page.trim())}`
     return `[${label}](${href})`
   })
 }
