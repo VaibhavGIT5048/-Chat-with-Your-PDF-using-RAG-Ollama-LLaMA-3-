@@ -95,7 +95,6 @@ export function PipelineVisualiser({ stage, className = '' }: Props) {
                 transformOrigin: 'center',
               }}
             >
-              <title>{node.detail ?? node.label}</title>
               <rect
                 x={node.x}
                 y={node.y}
