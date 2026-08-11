@@ -52,10 +52,10 @@ const ARCHITECTURE = [
 ]
 
 const FEATURES = [
-  { t: 'Semantic chunking', d: 'Splits on meaning, not character counts, so chunks stay coherent.' },
+  { t: 'Structure-aware chunking', d: 'Splits around headings and sections, falling back to recursive chunks only when a section is oversized.' },
   {
     t: 'Chunk quality gate',
-    d: 'Scores each chunk out of 7 and drops the ones below your threshold.',
+    d: 'Scores chunks and applies a soft retrieval penalty; every non-empty chunk remains indexed.',
   },
   { t: 'Hybrid retrieval', d: 'Dense vectors and sparse keywords searched in parallel.' },
   {
@@ -68,6 +68,8 @@ const FEATURES = [
     t: 'Inline citations',
     d: 'Every claim tagged with its file and page, rendered as linked chips.',
   },
+  { t: 'Parser router', d: 'Routes PDF, Office, image and CSV files through local and OCR adapters with fallback tiers.' },
+  { t: 'JWT + guardrails', d: 'Every document route is account-scoped and retrieved text is treated as untrusted data.' },
   { t: 'RAGAS harness', d: 'Faithfulness and relevancy measured offline, not guessed at.' },
 ]
 
@@ -199,7 +201,6 @@ export function LandingView() {
         </div>
       </section>
 
-      {/* Stated accurately: self-hosted retrieval, but generation is OpenAI's API. */}
       <section className="mx-auto max-w-[1180px] px-[26px] pb-[90px]">
         <div className="p-11" style={{ background: 'var(--accent)', color: 'var(--on-accent)' }}>
           <div className="mb-4 text-[11px] font-extrabold uppercase tracking-[0.14em] opacity-75">

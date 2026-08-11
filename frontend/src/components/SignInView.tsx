@@ -116,6 +116,25 @@ export function SignInView() {
         email address.
       </p>
 
+      <div className="mt-6 flex gap-2" role="tablist" aria-label="Account access">
+        <Button
+          variant={mode === 'signin' ? 'solid' : 'ghost'}
+          onClick={() => { setMode('signin'); setError(null) }}
+          aria-selected={mode === 'signin'}
+          role="tab"
+        >
+          Sign in
+        </Button>
+        <Button
+          variant={mode === 'signup' ? 'solid' : 'ghost'}
+          onClick={() => { setMode('signup'); setError(null) }}
+          aria-selected={mode === 'signup'}
+          role="tab"
+        >
+          Create account
+        </Button>
+      </div>
+
       <Panel className="mt-8">
         <PanelHeader title={mode === 'signin' ? 'Sign in' : 'Create account'} />
         <div className="grid gap-4 p-5">

@@ -1,7 +1,8 @@
 'use client'
 
-// Animated node-graph of the real backend retrieval pipeline. The two retrieval
-// branches light in parallel then converge at the RRF node.
+// Animated node-graph of the real backend retrieval and ingest pipeline. Auth,
+// query rewriting and guardrails precede scoped hybrid retrieval; parser
+// routing is shown as the parallel ingest path.
 //
 // HONESTY: the frontend makes ONE /query call and receives ONE response, so it
 // has no per-stage telemetry. This is an illustrative choreography timed to the
@@ -24,10 +25,10 @@ export function PipelineVisualiser({ stage, className = '' }: Props) {
   return (
     <div className={className}>
       <svg
-        viewBox="0 0 940 590"
+        viewBox="0 0 940 740"
         style={{ width: '100%', height: 'auto', display: 'block', overflow: 'visible' }}
         role="img"
-        aria-label="Illustrative view of the retrieval pipeline: the question fans out to dense embedding search and sparse BM25 keyword search, merges at reciprocal rank fusion, then quality-gate weighting, Flashrank reranking, neighbour expansion and answer generation."
+        aria-label="Illustrative view of the pipeline: authentication and guardrails, query rewriting, parser routing, bge-m3 dense and BM25 sparse retrieval, RRF fusion, quality weighting, Flashrank reranking, neighbour expansion and gpt-5-mini answer generation."
       >
         {PIPE_EDGES.map((edge, i) => {
           const on = stage >= edge.stage
