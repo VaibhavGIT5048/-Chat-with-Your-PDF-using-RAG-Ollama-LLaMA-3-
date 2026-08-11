@@ -1,14 +1,20 @@
 name: Deploy backend to Azure
 
 # Branch → environment mapping:
-#   develop → staging  (rag-api-staging)  — test features here first
-#   main    → production (rag-api)        — only after staging looks good
+#   develop → dev/staging (rag-api-staging) — deploys automatically
+#   main    → production  (rag-api)         — MANUAL ONLY
 #
-# Both run the full test suite first; a failing test blocks the deploy.
+# Production is deliberately not on the push trigger. Merging to main used to
+# ship straight to the live app, which left no gap to exercise a change on the
+# dev environment first. Promote with:
+#   Actions → "Deploy backend to Azure" → Run workflow → target: production
+# (or `gh workflow run deploy-backend.yml -f target=production`).
+#
+# Both paths run the full test suite first; a failing test blocks the deploy.
 
 on:
   push:
-    branches: [main, develop]
+    branches: [develop]
     paths:
       - 'APP/**'
       - 'docker/Dockerfile.api'
