@@ -59,9 +59,18 @@ echo "    storage account: $STORAGE_ACCOUNT"
 
 STORAGE_KEY=$(az storage account keys list -n "$STORAGE_ACCOUNT" -g "$RG" --query "[0].value" -o tsv)
 
-az storage share-rm create \
-  --storage-account "$STORAGE_ACCOUNT" --name "$SHARE" --quota 5 \
-  --only-show-errors >/dev/null 2>&1 || echo "    (share already exists)"
+# Do NOT swallow stderr here. A failure that prints "(share already exists)"
+# regardless of cause once hid a share that was never created at all, and the
+# revision then crash-looped on VolumeMountFailure with no clue why.
+if ! az storage share-rm show \
+    --storage-account "$STORAGE_ACCOUNT" -g "$RG" --name "$SHARE" >/dev/null 2>&1; then
+  az storage share-rm create \
+    --storage-account "$STORAGE_ACCOUNT" -g "$RG" --name "$SHARE" --quota 5 \
+    --only-show-errors >/dev/null
+  echo "    share '$SHARE' created"
+else
+  echo "    share '$SHARE' already exists"
+fi
 
 az containerapp env storage set -n "$ENVIRONMENT" -g "$RG" \
   --storage-name "$SHARE" \

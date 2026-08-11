@@ -78,10 +78,13 @@ def _new_id() -> str:
 @contextmanager
 def _connect() -> Iterator[sqlite3.Connection]:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    # Not WAL: data/ is an Azure Files (SMB) mount, and WAL needs shared-memory
+    # mmap plus byte-range locks that SMB doesn't provide — every connection
+    # dies with "database is locked". Single-writer holds given maxReplicas: 1.
+    conn.execute("PRAGMA journal_mode = DELETE")
     try:
         yield conn
         conn.commit()
