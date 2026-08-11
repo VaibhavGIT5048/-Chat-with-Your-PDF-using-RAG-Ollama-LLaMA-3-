@@ -115,18 +115,30 @@ echo "==> 4/4  Mount the volume"
 # `az containerapp update` has no --volume flag, so the mount has to go
 # through a YAML patch of the existing template.
 TMP=$(mktemp -d)
-az containerapp show -n "$APP" -g "$RG" -o yaml > "$TMP/app.yaml"
-python3 - "$TMP/app.yaml" "$SHARE" "$MOUNT" <<'PY'
-import sys, yaml
+# JSON, not YAML: PyYAML isn't in the stdlib, and when it's missing this
+# heredoc fails while the `az update` after it still "succeeds" against an
+# unpatched file — the mount silently never lands. JSON is valid YAML to az.
+az containerapp show -n "$APP" -g "$RG" -o json > "$TMP/app.json"
+python3 - "$TMP/app.json" "$SHARE" "$MOUNT" <<'PY'
+import sys, json
 path, share, mount = sys.argv[1], sys.argv[2], sys.argv[3]
-doc = yaml.safe_load(open(path))
+doc = json.load(open(path))
 tpl = doc["properties"]["template"]
-tpl["volumes"] = [{"name": "rag-data-volume", "storageName": share, "storageType": "AzureFile"}]
+tpl["volumes"] = [{
+    "name": "rag-data-volume",
+    "storageName": share,
+    "storageType": "AzureFile",
+    # SQLite uses fcntl byte-range locks, which SMB/CIFS can't honour: every
+    # write fails SQLITE_BUSY ("database is locked") and the app dies during
+    # startup. nobrl makes those locks no-ops — safe only because maxReplicas
+    # is 1, so there is exactly one writer.
+    "mountOptions": "uid=1000,gid=1000,dir_mode=0777,file_mode=0777,nobrl",
+}]
 for c in tpl["containers"]:
     c["volumeMounts"] = [{"volumeName": "rag-data-volume", "mountPath": mount}]
-yaml.safe_dump(doc, open(path, "w"), sort_keys=False)
+json.dump(doc, open(path, "w"), indent=2)
 PY
-az containerapp update -n "$APP" -g "$RG" --yaml "$TMP/app.yaml" --only-show-errors >/dev/null
+az containerapp update -n "$APP" -g "$RG" --yaml "$TMP/app.json" --only-show-errors >/dev/null
 rm -rf "$TMP"
 echo "    volume mounted at $MOUNT"
 
