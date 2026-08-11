@@ -15,7 +15,7 @@ const LABEL: Record<HealthState, string> = {
   ok: 'Connected',
   degraded: 'Degraded',
   offline: 'Offline',
-  checking: 'Checking',
+  checking: 'Checking connectivity',
 }
 
 function colorFor(state: HealthState) {
@@ -88,7 +88,7 @@ export function StatusBadge() {
           }}
         >
           <div className="mb-2 text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-55">
-            Backend subsystems
+            Backend connectivity
           </div>
           <div className="grid gap-[8px] text-[13px]">
             <div className="grid grid-cols-[auto_minmax(0,1fr)] items-baseline gap-4">

@@ -1,8 +1,8 @@
 'use client'
 
 // The gateway. Two prominent links (repo + downloadable instructions), real
-// copy-pasteable commands, and a live waiting indicator that auto-advances to
-// the workbench the moment /health reports ok.
+// copy-pasteable commands, and a live connectivity indicator. The user chooses
+// when to enter the workbench.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
@@ -22,8 +22,6 @@ const COMMANDS = [
   { n: '03', cmd: 'cp .env.example .env', note: 'then open .env and set OPENAI_API_KEY=sk-…' },
   { n: '04', cmd: 'docker compose up -d', note: 'first boot pulls images — a few minutes' },
 ]
-
-const ADVANCE_DELAY_MS = 2000
 
 function CopyableCommand({ n, cmd, note }: { n: string; cmd: string; note?: string }) {
   const [copied, setCopied] = useState(false)
@@ -66,37 +64,6 @@ function CopyableCommand({ n, cmd, note }: { n: string; cmd: string; note?: stri
 export function SetupView() {
   const router = useRouter()
   const { isConnected, health, attempts, lastCheckedAt, checkNow } = useHealth()
-  const [advancing, setAdvancing] = useState(false)
-  const [cancelled, setCancelled] = useState(false)
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const clearTimer = useCallback(() => {
-    if (timer.current) {
-      clearTimeout(timer.current)
-      timer.current = null
-    }
-  }, [])
-
-  // Auto-advance only from here, where the visitor is explicitly waiting — and
-  // always with a visible escape hatch.
-  useEffect(() => {
-    if (!isConnected || cancelled) {
-      setAdvancing(false)
-      return
-    }
-    setAdvancing(true)
-    clearTimer()
-    timer.current = setTimeout(() => router.push('/workbench'), ADVANCE_DELAY_MS)
-    return clearTimer
-  }, [isConnected, cancelled, router, clearTimer])
-
-  useEffect(() => clearTimer, [clearTimer])
-
-  const cancel = () => {
-    clearTimer()
-    setAdvancing(false)
-    setCancelled(true)
-  }
 
   const lastCheckedLabel = lastCheckedAt
     ? `last checked ${new Date(lastCheckedAt).toLocaleTimeString()}`
@@ -106,11 +73,11 @@ export function SetupView() {
     <main className="relative z-10 mx-auto max-w-[1000px] px-[26px] pb-[90px] pt-16">
       <Eyebrow className="mb-[18px]">Step 1 of 1</Eyebrow>
       <h1 className="m-0 mb-[18px] max-w-[20ch] text-[clamp(36px,5vw,60px)] font-extrabold leading-none tracking-[-0.035em]">
-        Run the backend on your machine.
+        Check your connection, then start working.
       </h1>
       <p className="m-0 mb-10 max-w-[58ch] text-[18px] opacity-70">
-        The stack runs in Docker on your own hardware. Four commands, one API key, a few minutes on
-        first boot. This page watches for it and takes you through the moment it answers.
+        The hosted API is checked continuously. You can also run the stack locally with Docker, but
+        this page will never move you away without your click.
       </p>
 
       {/* The two links, as twin cards. */}
@@ -235,24 +202,15 @@ export function SetupView() {
               />
             </div>
             <h3 className="m-0 text-[28px] font-extrabold tracking-[-0.025em]">
-              Backend detected.
+              Backend connectivity confirmed.
             </h3>
             <div className="text-[14px] opacity-70">
               Qdrant {health?.qdrant ?? '—'} · OpenAI {health?.openai ?? '—'} · collection{' '}
               {health?.collection_name ?? '—'}
             </div>
-            {advancing ? (
-              <div className="flex flex-wrap items-center gap-[14px]">
-                <span className="text-[15px] font-extrabold">Taking you to the workbench…</span>
-                <Button variant="chip" onClick={cancel}>
-                  Cancel / stay here
-                </Button>
-              </div>
-            ) : (
-              <Button variant="cta" onClick={() => router.push('/workbench')}>
-                Open the workbench →
-              </Button>
-            )}
+            <Button variant="cta" onClick={() => router.push('/workbench')}>
+              Open the workbench →
+            </Button>
           </div>
         ) : (
           <div className="flex flex-wrap items-start gap-[18px]">
