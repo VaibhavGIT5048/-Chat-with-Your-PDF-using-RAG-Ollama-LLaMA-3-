@@ -207,6 +207,35 @@ def _collection_exists(client, collection_name: str) -> bool:
             return False
 
 
+# Every retrieval filters on document_id (and owner_id), and Qdrant refuses to
+# filter on a payload key that has no index — the search fails outright with
+# "Index required but not found", not merely slowly. Creating an index that
+# already exists is a no-op, so this runs on every ingest rather than only at
+# collection creation: collections built before these filters existed have to
+# pick the indexes up too.
+_INDEXED_PAYLOAD_KEYS = ("document_id", "owner_id")
+
+
+def _ensure_payload_indexes(client, collection_name: str) -> None:
+    for key in _INDEXED_PAYLOAD_KEYS:
+        try:
+            if qdrant_models is not None:
+                client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name=key,
+                    field_schema=qdrant_models.PayloadSchemaType.KEYWORD,
+                )
+            else:
+                client.create_payload_index(
+                    collection_name=collection_name, field_name=key, field_schema="keyword"
+                )
+        except Exception:
+            # Already-indexed is the common case and reports as an error on
+            # some server versions; a genuine failure surfaces on the next
+            # filtered search rather than blocking the ingest that just ran.
+            pass
+
+
 def build_hybrid_indices(chunks, document_id: str, owner_id: str, vectors: list[list[float]] | None = None, embeddings=None):
     """Indexes one document's chunks into the shared Qdrant collection
     (create-if-missing + upsert — never destructive, unlike the old
@@ -260,6 +289,8 @@ def build_hybrid_indices(chunks, document_id: str, owner_id: str, vectors: list[
                 client.create_collection(collection_name=collection_name, vectors_config={"size": vector_size, "distance": "Cosine"})
         except Exception:
             pass
+
+    _ensure_payload_indexes(client, collection_name)
 
     points = []
     for c, v in zip(chunks, vectors):

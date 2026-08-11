@@ -116,14 +116,6 @@ def create_app() -> FastAPI:
         if origin.strip()
     ]
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_credentials=False,  # no cookies used; wildcard+credentials was invalid anyway
-        allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["Content-Type", "Authorization", "X-Request-ID", "X-OpenAI-Api-Key"],
-    )
-
     app.state.limiter = limiter
     app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
@@ -135,6 +127,19 @@ def create_app() -> FastAPI:
         response = None
         try:
             response = await call_next(request)
+            return response
+        except Exception:
+            # Handled here rather than left to Starlette's ServerErrorMiddleware.
+            # That one sits outside every user middleware, including CORS, so the
+            # 500 it produces carries no Access-Control-Allow-Origin — the browser
+            # then blocks the response and the caller sees a generic network
+            # failure instead of the actual error. Returning it from inside means
+            # CORS still wraps it and the real detail reaches the client.
+            logger.exception("unhandled_exception", request_id=request_id)
+            response = JSONResponse(
+                status_code=500,
+                content={"detail": "Internal server error", "request_id": request_id},
+            )
             return response
         finally:
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
@@ -149,6 +154,16 @@ def create_app() -> FastAPI:
                 status_code=status_code,
                 duration_ms=duration_ms,
             )
+
+    # Added last on purpose: add_middleware prepends, so the last one registered
+    # ends up outermost and therefore wraps the error handling above.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_credentials=False,  # no cookies used; wildcard+credentials was invalid anyway
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Content-Type", "Authorization", "X-Request-ID", "X-OpenAI-Api-Key"],
+    )
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):
