@@ -47,11 +47,6 @@ interface Turn {
   /** Collapsed by default — several expanded source cards per turn drowns
    *  out the answer itself. Clicking a citation forces this open. */
   sourcesOpen?: boolean
-  /** Only meaningful for a turn rendered as a history-rail row (i.e. not the
-   *  newest one, which always renders in full in the main column). Collapsed
-   *  by default so the rail is a scannable list of questions, not a second
-   *  copy of the whole conversation. */
-  historyOpen?: boolean
 }
 
 interface CitationFocus {
@@ -95,6 +90,10 @@ export function WorkbenchView() {
   // every restored conversation render its most recent answer as an empty
   // string, because `typed` starts at 0 and no timer ever runs for history.
   const [typingTurnId, setTypingTurnId] = useState<string | null>(null)
+  // Which turn the main answer area is showing. null means "the newest",
+  // rather than pinning an id, so a new answer takes over automatically
+  // without needing to be written here too.
+  const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null)
   const [focus, setFocus] = useState<CitationFocus | null>(null)
   const [refreshToken, setRefreshToken] = useState(0)
   const [byoKey, setByoKey] = useState('')
@@ -193,17 +192,13 @@ export function WorkbenchView() {
 
   // Focusing a citation highlights one source card, so the dropdown holding
   // that card has to open too — otherwise the highlight lands inside a
-  // collapsed panel and the click appears to do nothing. historyOpen is the
-  // same idea one level up: a citation on an older turn is only reachable at
-  // all once that turn's rail row is expanded, so this opens both regardless
-  // of which one the click actually happened in — harmless on the newest
-  // turn, which has no rail row to open.
+  // collapsed panel and the click appears to do nothing.
   const focusCitation = useCallback(
     (turnId: string, source: string, page: string) => {
       const alreadyFocused =
         focus?.turnId === turnId && focus.source === source && focus.page === page
       setFocus(alreadyFocused ? null : { turnId, source, page })
-      if (!alreadyFocused) patchTurn(turnId, { sourcesOpen: true, historyOpen: true })
+      if (!alreadyFocused) patchTurn(turnId, { sourcesOpen: true })
     },
     [focus, patchTurn],
   )
@@ -221,6 +216,9 @@ export function WorkbenchView() {
     // Resetting `typed` without releasing the previous turn would blank an
     // answer that is still mid-reveal until the new one arrives.
     setTypingTurnId(null)
+    // Snap back to the newest turn, so an answer asked for while reading an
+    // older one still appears rather than arriving off-screen in the rail.
+    setSelectedTurnId(null)
     setPipeStage(0)
     setFocus(null)
     setBusy('querying')
@@ -281,11 +279,18 @@ export function WorkbenchView() {
   // chronological (oldest first) whether it came from getChatHistory or from
   // appending a fresh question, so the last element is always "newest".
   const latestTurn = transcript.at(-1) ?? null
-  const olderTurns = transcript.length > 1 ? transcript.slice(0, -1) : []
+  // The rail SELECTS which turn the main area shows; it does not expand turns
+  // in place. Expanding inline meant rendering a full answer into a ~260px
+  // column — text wrapping every three words — and, worse, it made the rail
+  // tall enough to stretch the whole grid row, leaving a large void beside the
+  // short panels next to it. This is the pattern a conversation sidebar
+  // normally uses: the list navigates, the main pane displays.
+  const selectedTurn = transcript.find((turn) => turn.id === selectedTurnId) ?? latestTurn
+  const viewingOlder = Boolean(selectedTurn && latestTurn && selectedTurn.id !== latestTurn.id)
   // Drives both the column template and the bottom row's span. They have to
   // agree: a span wider than the template silently creates an implicit extra
   // column, which is a different broken layout rather than an error.
-  const hasRail = olderTurns.length > 0
+  const hasRail = transcript.length > 1
 
   const renderAnswer = (turn: Turn) => {
     const full = turn.answer ?? ''
@@ -376,16 +381,14 @@ export function WorkbenchView() {
   // history-rail row once it's expanded; identical either way, so citation
   // focus and the sources dropdown behave the same regardless of where a turn
   // happens to be rendered.
-  const renderTurnBody = (turn: Turn, wide = false) => {
+  const renderTurnBody = (turn: Turn) => {
     const sourceMax = maxScore(turn.sources)
     const focusedIndices =
       focus?.turnId === turn.id ? matchSourceIndices(turn.sources, focus.source, focus.page) : []
-    // Sources sit beside the answer in the wide layout rather than under it,
-    // so starting them open costs no vertical space and fills a column that
-    // would otherwise be blank. In the narrow rail they stay collapsed, where
-    // stacking several expanded cards is exactly the noise worth avoiding.
-    // `?? wide` keeps an explicit toggle winning over the per-layout default.
-    const sourcesOpen = turn.sourcesOpen ?? wide
+    // Sources sit beside the answer rather than under it, so starting them
+    // open costs no vertical space and fills a column that would otherwise be
+    // blank. `??` keeps an explicit toggle winning over that default.
+    const sourcesOpen = turn.sourcesOpen ?? true
 
     return (
       <div className="grid gap-4 p-5">
@@ -410,21 +413,15 @@ export function WorkbenchView() {
         )}
 
         {turn.answer && !turn.error && (
-          // Wide: prose and sources side by side. The prose column is capped
-          // at a readable measure (see renderAnswer), so the leftover width
-          // goes to the sources rather than stretching lines to 200 characters.
-          <div
-            className={
-              wide
-                // `auto` rather than a fixed fr: the prose is capped at 76ch,
-                // so a fixed ratio would leave dead space between the two
-                // columns whenever the cap bit. Sizing the prose track to its
-                // content and giving the remainder to the sources means the
-                // full width is always used, whatever the answer's length.
-                ? 'grid items-start gap-6 xl:grid-cols-[auto_minmax(0,1fr)]'
-                : 'grid gap-4'
-            }
-          >
+          // Prose and sources side by side. The prose column is capped at a
+          // readable measure (see renderAnswer), so the leftover width goes to
+          // the sources rather than stretching lines to 200 characters.
+          //
+          // `auto` rather than a fixed fr: with the cap in play a fixed ratio
+          // would leave dead space between the two columns whenever it bit.
+          // Sizing the prose track to its content and giving the remainder to
+          // the sources means the full width is used at any answer length.
+          <div className="grid items-start gap-6 xl:grid-cols-[auto_minmax(0,1fr)]">
             <div className="min-w-0">{renderAnswer(turn)}</div>
 
             <div className="min-w-0">
@@ -459,15 +456,13 @@ export function WorkbenchView() {
                       `.grid` utility sits in a later layer than preflight's
                       `[hidden]` rule at equal specificity, so it would win and
                       the collapsed panel would stay on screen.
-                      Capped height in the wide layout so a ten-source answer
+                      Capped height once side by side, so a ten-source answer
                       scrolls its own column instead of setting the height of
                       the whole panel. */}
                   <div
                     id={`sources-${turn.id}`}
                     className={
-                      sourcesOpen
-                        ? `grid gap-3 ${wide ? 'xl:max-h-[68vh] xl:overflow-y-auto xl:pr-1' : ''}`
-                        : 'hidden'
+                      sourcesOpen ? 'grid gap-3 xl:max-h-[68vh] xl:overflow-y-auto xl:pr-1' : 'hidden'
                     }
                   >
                     {turn.sources.map((source, index) => {
@@ -756,54 +751,65 @@ export function WorkbenchView() {
                 title="History"
                 right={
                   <span className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-50">
-                    {olderTurns.length} earlier
+                    {transcript.length} turns
                   </span>
                 }
               />
-              <div className="grid" style={{ gap: 'var(--brd-w)', background: 'var(--brd)' }}>
-                {olderTurns
+              {/* Bounded and scrolled internally. An unbounded rail grows with
+                  the conversation, and because a grid row is as tall as its
+                  tallest item, that stretched the entire row and left a void
+                  beside the shorter panels. A fixed px cap rather than a vh
+                  one, so browser zoom cannot turn it back into a full-page
+                  column. */}
+              <div
+                className="max-h-[420px] overflow-y-auto"
+                style={{ display: 'grid', gap: 'var(--brd-w)', background: 'var(--brd)' }}
+              >
+                {transcript
                   .slice()
                   .reverse()
-                  .map((turn) => (
-                    <div key={turn.id} className="min-w-0" style={{ background: 'var(--panel-solid)' }}>
+                  .map((turn) => {
+                    const active = turn.id === selectedTurn?.id
+                    const isLatest = turn.id === latestTurn?.id
+                    return (
                       <button
+                        key={turn.id}
                         type="button"
-                        onClick={() => patchTurn(turn.id, { historyOpen: !turn.historyOpen })}
-                        aria-expanded={Boolean(turn.historyOpen)}
-                        className="flex w-full items-start gap-2 px-4 py-3 text-left transition-colors hover:opacity-90"
+                        onClick={() => setSelectedTurnId(isLatest ? null : turn.id)}
+                        aria-current={active ? 'true' : undefined}
+                        className="flex w-full min-w-0 items-start gap-2 px-4 py-3 text-left transition-colors"
+                        style={{
+                          background: active
+                            ? 'color-mix(in srgb, var(--accent) 10%, var(--panel-solid))'
+                            : 'var(--panel-solid)',
+                          // A left rule rather than a full border, so switching
+                          // selection does not shift the text by a pixel.
+                          boxShadow: active ? 'inset 3px 0 0 0 var(--accent)' : 'none',
+                        }}
                       >
-                        <ChevronRight
-                          size={13}
-                          aria-hidden
-                          className="mt-[3px] shrink-0"
-                          style={{
-                            transform: turn.historyOpen ? 'rotate(90deg)' : 'none',
-                            transition: 'transform .18s ease',
-                          }}
-                        />
-                        <span
-                          className="min-w-0 flex-1 text-[13px] font-extrabold leading-[1.4]"
-                          style={{
-                            display: '-webkit-box',
-                            WebkitLineClamp: 2,
-                            WebkitBoxOrient: 'vertical',
-                            overflow: 'hidden',
-                            // A pasted question can be one very long word; without
-                            // this it would widen the rail instead of wrapping.
-                            overflowWrap: 'anywhere',
-                          }}
-                        >
-                          {turn.question}
+                        <span className="min-w-0 flex-1">
+                          <span
+                            className="block text-[13px] font-extrabold leading-[1.4]"
+                            style={{
+                              display: '-webkit-box',
+                              WebkitLineClamp: 2,
+                              WebkitBoxOrient: 'vertical',
+                              overflow: 'hidden',
+                              // A pasted question can be one very long word;
+                              // without this it would widen the rail rather
+                              // than wrap inside it.
+                              overflowWrap: 'anywhere',
+                            }}
+                          >
+                            {turn.question}
+                          </span>
+                          <span className="mt-[3px] block text-[10.5px] font-extrabold uppercase tracking-[0.08em] opacity-45">
+                            {isLatest ? 'Latest' : `${turn.sources.length} sources`}
+                          </span>
                         </span>
                       </button>
-                      {/* Real conditional, not a CSS hide: a collapsed row's
-                          answer is never asked for again, so there is no
-                          reason to Markdown-parse it on every render — and
-                          the newest turn's typing animation re-renders this
-                          whole view roughly 40 times a second. */}
-                      {turn.historyOpen && renderTurnBody(turn)}
-                    </div>
-                  ))}
+                    )
+                  })}
               </div>
             </Panel>
           </div>
@@ -812,7 +818,7 @@ export function WorkbenchView() {
         {/* The answer gets the full page width on its own row, rather than
             being confined to the query column with the rest of the viewport
             left blank beside it. Its internal split (prose | sources) is what
-            actually consumes that width — see renderTurnBody's `wide`. */}
+            actually consumes that width — see renderTurnBody. */}
         <div className={`grid min-w-0 gap-7 lg:col-span-2 ${hasRail ? 'xl:col-span-3' : ''}`}>
           {historyError && (
             <Panel>
@@ -845,10 +851,28 @@ export function WorkbenchView() {
               </div>
             </Panel>
           ) : (
-            // Only the newest turn renders here — everything before it is in
-            // the history rail instead of stacking on top of the answer
+            // One turn at a time, always at full width — whichever the rail
+            // has selected, defaulting to the newest. Older turns are reached
+            // by selecting them, not by stacking them on top of the answer
             // someone just asked for.
-            latestTurn && <Panel key={latestTurn.id}>{renderTurnBody(latestTurn, true)}</Panel>
+            selectedTurn && (
+              <Panel key={selectedTurn.id}>
+                {viewingOlder && (
+                  <div
+                    className="flex flex-wrap items-center justify-between gap-3 px-5 py-3"
+                    style={{ borderBottom: 'var(--brd-w) solid var(--brd)' }}
+                  >
+                    <span className="text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
+                      Viewing an earlier turn
+                    </span>
+                    <Button variant="chip" onClick={() => setSelectedTurnId(null)}>
+                      Back to latest
+                    </Button>
+                  </div>
+                )}
+                {renderTurnBody(selectedTurn)}
+              </Panel>
+            )
           )}
         </div>
 
