@@ -282,6 +282,10 @@ export function WorkbenchView() {
   // appending a fresh question, so the last element is always "newest".
   const latestTurn = transcript.at(-1) ?? null
   const olderTurns = transcript.length > 1 ? transcript.slice(0, -1) : []
+  // Drives both the column template and the bottom row's span. They have to
+  // agree: a span wider than the template silently creates an implicit extra
+  // column, which is a different broken layout rather than an error.
+  const hasRail = olderTurns.length > 0
 
   const renderAnswer = (turn: Turn) => {
     const full = turn.answer ?? ''
@@ -517,15 +521,19 @@ export function WorkbenchView() {
 
   return (
     <main className="relative z-10 mx-auto max-w-[1320px] px-[26px] pb-20 pt-8">
-      <section className="mb-8 flex flex-wrap items-end justify-between gap-6">
-        <div className="max-w-[52ch]">
-          <Eyebrow className="mb-4">Workbench</Eyebrow>
-          <h1 className="m-0 text-[clamp(34px,4.8vw,58px)] font-extrabold leading-[0.96] tracking-[-0.035em]">
+      {/* Deliberately restrained for a page people return to and work in: a
+          58px three-line hero plus a paragraph pushed the query box and the
+          answer below the fold on every visit, to say something already read
+          on the first one. */}
+      <section className="mb-6 flex flex-wrap items-end justify-between gap-6">
+        <div className="max-w-[62ch]">
+          <Eyebrow className="mb-2">Workbench</Eyebrow>
+          <h1 className="m-0 text-[clamp(24px,2.4vw,32px)] font-extrabold leading-[1.05] tracking-[-0.03em]">
             Ingest a PDF, ask a question, inspect the sources.
           </h1>
-          <p className="m-0 mt-4 text-[17px] leading-[1.55] opacity-70">
-            The backend stays honest: every answer is grounded, every citation is clickable, and every
-            collection delete is typed-confirmed.
+          <p className="m-0 mt-2 text-[14px] leading-[1.5] opacity-65">
+            Every answer is grounded, every citation is clickable, and every collection delete is
+            typed-confirmed.
           </p>
         </div>
 
@@ -569,8 +577,23 @@ export function WorkbenchView() {
         )}
       </section>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(260px,0.65fr)_minmax(440px,1.35fr)_minmax(260px,0.8fr)]">
-        <div className="grid gap-7">
+      {/* Every track is minmax(0, …) rather than a px minimum. Fixed minimums
+          summed wider than the container at the breakpoint that enabled them,
+          so the grid overflowed and columns bled into each other; a 0 minimum
+          can always shrink to fit. The third column only appears at xl, where
+          there is genuinely room for it.
+          items-start stops the columns stretching to match the tallest one. */}
+      <div
+        className={`grid items-start gap-7 ${
+          hasRail
+            ? 'lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.7fr)] xl:grid-cols-[minmax(0,0.75fr)_minmax(0,1.7fr)_minmax(0,0.85fr)]'
+            : 'lg:grid-cols-[minmax(0,0.8fr)_minmax(0,1.7fr)]'
+        }`}
+      >
+        {/* min-w-0 on the column itself: a grid item defaults to
+            min-width:auto, so one long unbreakable string (a document UUID)
+            would otherwise push the whole track wider than its share. */}
+        <div className="grid min-w-0 content-start gap-7">
           <IngestPanel
             connected={connected}
             hasExistingIndex={hasExistingIndex}
@@ -580,8 +603,8 @@ export function WorkbenchView() {
           {/* One slim row instead of a header + three stacked rows — the same
               three facts, without a card's worth of padding around each. */}
           <Panel>
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 text-[12.5px]">
-              <span className="flex items-center gap-[6px] font-extrabold">
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 px-4 py-3 text-[12.5px]">
+              <span className="flex shrink-0 items-center gap-[6px] font-extrabold">
                 <span
                   className="h-2 w-2 rounded-full"
                   aria-hidden
@@ -589,17 +612,23 @@ export function WorkbenchView() {
                 />
                 {connected ? 'Connected' : 'Offline'}
               </span>
-              <span className="opacity-35">·</span>
-              <span className="min-w-0 truncate" title={documentId ?? undefined}>
-                <Mono className="opacity-70">{documentId ?? 'No document selected'}</Mono>
+              <span className="shrink-0 opacity-35">·</span>
+              {/* The document id is a 36-char unbreakable UUID. It needs both a
+                  0 minimum and its own overflow rule, or it sets the width of
+                  everything upstream of it. */}
+              <span
+                className="min-w-0 flex-1 truncate font-mono text-[11.5px] opacity-70"
+                title={documentId ?? undefined}
+              >
+                {documentId ?? 'No document selected'}
               </span>
-              <span className="opacity-35">·</span>
-              <span className="opacity-70">{querying ? QUERY_STAGES[thinkingIdx] : 'Ready'}</span>
+              <span className="shrink-0 opacity-35">·</span>
+              <span className="shrink-0 opacity-70">{querying ? QUERY_STAGES[thinkingIdx] : 'Ready'}</span>
             </div>
           </Panel>
         </div>
 
-        <div className="grid gap-7">
+        <div className="grid min-w-0 content-start gap-7">
           <Panel>
             <PanelHeader
               title="Query"
@@ -724,22 +753,10 @@ export function WorkbenchView() {
             // the answer someone just asked for.
             latestTurn && <Panel key={latestTurn.id}>{renderTurnBody(latestTurn)}</Panel>
           )}
-
-          <Panel>
-            <PanelHeader
-              title="Pipeline"
-              right={<span className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-50">illustrative</span>}
-            />
-            <div className="p-6">
-              <div className="max-w-[940px]">
-                <PipelineVisualiser stage={pipeStage} />
-              </div>
-            </div>
-          </Panel>
         </div>
 
-        {olderTurns.length > 0 && (
-          <div className="grid content-start gap-4">
+        {hasRail && (
+          <div className="grid min-w-0 content-start gap-4">
             <Panel>
               <PanelHeader
                 title="History"
@@ -754,7 +771,7 @@ export function WorkbenchView() {
                   .slice()
                   .reverse()
                   .map((turn) => (
-                    <div key={turn.id} style={{ background: 'var(--panel-solid)' }}>
+                    <div key={turn.id} className="min-w-0" style={{ background: 'var(--panel-solid)' }}>
                       <button
                         type="button"
                         onClick={() => patchTurn(turn.id, { historyOpen: !turn.historyOpen })}
@@ -770,7 +787,18 @@ export function WorkbenchView() {
                             transition: 'transform .18s ease',
                           }}
                         />
-                        <span className="min-w-0 flex-1 text-[13px] font-extrabold leading-[1.4]" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                        <span
+                          className="min-w-0 flex-1 text-[13px] font-extrabold leading-[1.4]"
+                          style={{
+                            display: '-webkit-box',
+                            WebkitLineClamp: 2,
+                            WebkitBoxOrient: 'vertical',
+                            overflow: 'hidden',
+                            // A pasted question can be one very long word; without
+                            // this it would widen the rail instead of wrapping.
+                            overflowWrap: 'anywhere',
+                          }}
+                        >
                           {turn.question}
                         </span>
                       </button>
@@ -787,7 +815,22 @@ export function WorkbenchView() {
           </div>
         )}
 
-        <div className="lg:col-span-3">
+        {/* Pipeline and Collections are reference material, not part of the
+            ask-and-read loop — full width underneath, so neither pushes the
+            answer down the page. */}
+        <div className={`grid min-w-0 gap-7 lg:col-span-2 ${hasRail ? 'xl:col-span-3' : ''}`}>
+          <Panel>
+            <PanelHeader
+              title="Pipeline"
+              right={<span className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-50">illustrative</span>}
+            />
+            <div className="overflow-x-auto p-6">
+              <div className="min-w-[720px] max-w-[940px]">
+                <PipelineVisualiser stage={pipeStage} />
+              </div>
+            </div>
+          </Panel>
+
           <CollectionsPanel refreshToken={refreshToken} />
         </div>
       </div>
