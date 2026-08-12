@@ -32,6 +32,7 @@ export const BYO_OPENAI_KEY_HEADER = 'X-OpenAI-Api-Key'
 export const ROUTES = {
   health: '/health',
   ready: '/ready',
+  warmup: '/warmup',
   ingest: '/ingest',
   ingestAsync: '/ingest/async',
   ingestJob: (id: string) => `/ingest/jobs/${encodeURIComponent(id)}`,
@@ -53,6 +54,12 @@ export const ROUTES = {
 // embedding call per chunk and legitimately takes minutes on a real PDF.
 export const TIMEOUTS = {
   health: 8_000,
+  // The backend scales to zero when idle, and Container Apps holds the first
+  // request open while it activates a replica — which takes far longer than the
+  // 8s a warm probe needs. Aborting at 8s is what made a normal wake render as
+  // "Backend unavailable", so the probe that might be waking it gets its own,
+  // much longer budget.
+  healthCold: 60_000,
   auth: 30_000,
   query: 120_000,
   ingest: 600_000,
@@ -62,6 +69,10 @@ export const TIMEOUTS = {
 export const POLL_MS = {
   setup: 5_000,
   other: 20_000,
+  // While offline, check back quickly: the backend usually returns within a
+  // minute of being woken, and waiting a full 20s to notice adds delay that
+  // isn't the cold start's fault.
+  offline: 3_000,
 } as const
 
 export const INGEST_DEFAULTS = {

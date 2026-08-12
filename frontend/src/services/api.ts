@@ -148,14 +148,28 @@ const jsonHeaders = { 'Content-Type': 'application/json' }
 // Health
 // ---------------------------------------------------------------------------
 
-export function getHealth(signal?: AbortSignal) {
-  return request<HealthStatus>(ROUTES.health, { timeout: TIMEOUTS.health, signal })
+/** `cold` gives the request the much longer budget a scale-to-zero wake needs;
+ *  a warm probe should still fail fast so the UI notices a real outage. */
+export function getHealth(signal?: AbortSignal, cold = false) {
+  return request<HealthStatus>(ROUTES.health, {
+    timeout: cold ? TIMEOUTS.healthCold : TIMEOUTS.health,
+    signal,
+  })
 }
 
-/** Fired on /home and /workbench mount to absorb a scale-to-zero cold start
- *  during the seconds the user spends reading or choosing a file. */
+/** Fired when the app mounts, to absorb a scale-to-zero cold start during the
+ *  seconds the user spends reading the page or choosing a file.
+ *
+ *  Hits /warmup, not /health: /health touches no model, so it wakes the
+ *  container but leaves the embedding model and reranker to load on the first
+ *  question — which is where the wait was actually being felt. /warmup starts
+ *  that load in the background and returns immediately.
+ */
 export function warmup() {
-  return getHealth().catch(() => null)
+  return request<{ status: string }>(ROUTES.warmup, {
+    method: 'POST',
+    timeout: TIMEOUTS.healthCold,
+  }).catch(() => null)
 }
 
 // ---------------------------------------------------------------------------

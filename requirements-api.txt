@@ -23,3 +23,6 @@ httpx
 sentence-transformers
 slowapi
 azure-ai-documentintelligence
+# Optional cache tier in front of the per-query BM25 read off Azure Files.
+# The app runs fine without REDIS_URL set — see APP/rag/cache.py.
+redis

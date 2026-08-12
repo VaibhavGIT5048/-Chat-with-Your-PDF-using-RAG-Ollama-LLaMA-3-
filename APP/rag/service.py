@@ -9,11 +9,13 @@ from time import monotonic
 from typing import Any
 from uuid import uuid4
 
+import structlog
 import tiktoken
 from langchain_core.documents import Document
 from qdrant_client import QdrantClient
 
 from APP import db
+from APP.rag import cache as doc_cache
 from APP.rag.chunking import chunk_documents, save_chunks_jsonl
 from APP.rag.generator import SYSTEM_PROMPT
 from APP.parsers import parse_document
@@ -49,6 +51,8 @@ from APP.rag.vector_store import (
     hybrid_retrieve,
     load_document_index,
 )
+
+logger = structlog.get_logger("rag_service")
 
 _CONTEXT_TOKENIZER = tiktoken.get_encoding("cl100k_base")
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "6000"))
@@ -175,6 +179,11 @@ class RAGService:
             retrieval_chunks, document_id=document_id, owner_id=owner_id,
             vectors=retrieval_vectors, embeddings=self.embedding_provider,
         )
+        # Each ingest mints a fresh document_id, so nothing stale can be keyed
+        # here today. Kept so the cache stays correct if ingest ever reuses an
+        # id — re-indexing under a cached key is exactly how a cache starts
+        # answering from content the document no longer contains.
+        doc_cache.invalidate(owner_id, document_id)
         db.update_document_counts(document_id, chunks=len(retrieval_chunks), indexed_chunks=len(retrieval_chunks))
 
         stats = IngestResponse(
@@ -198,9 +207,28 @@ class RAGService:
         # document's vectors are permanently tied to whichever model/dimension
         # indexed them, and the collection has one fixed vector size, so query
         # embeddings must always match the same provider ingest used.
+        #
+        # Only the BM25 index and chunks are cached: those come from a pickle on
+        # the Azure Files share, which was being re-read on every question. The
+        # vectorstore is rebuilt each time instead — it wraps a live Qdrant
+        # client, which is cheap to construct and not something to hand around
+        # between requests.
+        cached = doc_cache.get(owner_id, document_id)
+        if cached is not None:
+            bm25, chunks = cached
+            vectorstore = QdrantVectorStore(
+                client=self.qdrant,
+                collection_name=self.settings.qdrant_collection,
+                embeddings=self.embedding_provider,
+                document_id=document_id,
+                owner_id=owner_id,
+            )
+            return vectorstore, bm25, chunks
+
         vectorstore, bm25, chunks = load_document_index(document_id, owner_id, embeddings=self.embedding_provider)
         if vectorstore is None or bm25 is None or chunks is None:
             raise FileNotFoundError(f"No index found for document {document_id}. Run /ingest first.")
+        doc_cache.put(owner_id, document_id, (bm25, chunks))
         return vectorstore, bm25, chunks
 
     def _rewrite_query_if_needed(self, question: str, history: list, chat_provider: ChatProvider) -> str:
@@ -255,7 +283,21 @@ class RAGService:
         # embeddings swap per-request would silently corrupt retrieval.
         chat_provider: ChatProvider = OpenAIChatProvider(byo_openai_key) if byo_openai_key else self.chat_provider
 
+        # Per-stage timings, because "queries feel slow" is not actionable on
+        # its own — the fix for a slow reranker and a slow generation are
+        # nothing alike, and the rewrite step quietly adds a second LLM round
+        # trip from the second question onward.
+        timings: dict[str, float] = {}
+        started = monotonic()
+
+        def _mark(stage: str) -> None:
+            nonlocal started
+            now = monotonic()
+            timings[stage] = round((now - started) * 1000, 1)
+            started = now
+
         vectorstore, bm25, chunks = self._load_document_artifacts(request.document_id, owner_id)
+        _mark("load_artifacts_ms")
 
         # Normalise before anything reads the question: NFKC folds homoglyph
         # lookalikes, and zero-width/bidi characters are stripped so hidden
@@ -264,6 +306,7 @@ class RAGService:
 
         history = [dict(t) for t in db.list_chat_turns(request.document_id, owner_id)]
         question = self._rewrite_query_if_needed(clean_question, history, chat_provider)
+        _mark("rewrite_ms")
 
         top_n = getattr(request, "top_k", None) or 5
 
@@ -274,6 +317,7 @@ class RAGService:
             chunks=chunks,
             top_n=top_n,
         )
+        _mark("retrieve_ms")
 
         # (A) expanded docs WITH scores — same set feeds prompt AND sources
         expanded = expand_with_neighbors_scored(results=results, chunks=chunks, window=1)
@@ -284,6 +328,7 @@ class RAGService:
         # to talk the model into echoing system instructions or internals, the
         # answer is replaced rather than returned.
         answer = validate_output(self._generate_answer(prompt, chat_provider))
+        _mark("generate_ms")
 
         sources = [
             SourceChunk(
@@ -298,6 +343,13 @@ class RAGService:
         db.create_chat_turn(
             request.document_id, owner_id, request.question, answer,
             json.dumps([s.model_dump() for s in sources]),
+        )
+        logger.info(
+            "query_timings",
+            document_id=request.document_id,
+            rewritten=question != clean_question,
+            sources=len(sources),
+            **timings,
         )
         return QueryResponse(
             request_id=str(uuid4()),
@@ -327,6 +379,10 @@ class RAGService:
         ]
 
     def remove_document(self, document_id: str, owner_id: str) -> bool:
+        # Drop the cached artifacts first: leaving them behind would keep a
+        # deleted document's chunks resident (and in Redis until its TTL) after
+        # the user asked for them to be gone.
+        doc_cache.invalidate(owner_id, document_id)
         return db.delete_document(document_id, owner_id)
 
     def health(self) -> HealthStatus:

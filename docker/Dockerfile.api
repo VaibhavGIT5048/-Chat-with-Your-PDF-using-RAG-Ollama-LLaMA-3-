@@ -29,7 +29,27 @@ COPY requirements-api.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -r requirements-api.txt
 
-# Stage 2: Runtime
+# Stage 2: Models
+#
+# Separate from the builder ON PURPOSE. The obvious place to fetch weights is
+# after the app's dependencies are installed — sentence-transformers is right
+# there — but a cache miss cascades to every later layer, so any
+# requirements-api.txt edit would re-download ~2.3GB. Keyed to fetch_models.py
+# alone, this layer survives dependency bumps and code changes alike, and only
+# a deliberate edit to the pins rebuilds it.
+FROM python:3.11-slim AS models
+
+# hf_transfer is a faster download backend; flashrank is needed to prefetch the
+# ranker through its own logic rather than guessing its URL. Neither pulls torch.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install "huggingface_hub[hf_transfer]" flashrank
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
+ENV MODEL_DIR=/opt/models
+
+COPY docker/fetch_models.py /fetch_models.py
+RUN python /fetch_models.py
+
+# Stage 3: Runtime
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -43,16 +63,44 @@ ENV PYTHONPATH="/home/appuser/app"
 RUN useradd --create-home appuser
 
 # Pre-create the volume mount points with correct ownership. data/ subpaths
-# (chunks/indexes/evals/flashrank_cache, rag.db, documents/{owner}/{doc}/)
-# are created on demand by the app itself (mkdir(parents=True, exist_ok=True)
-# at each write site), so nothing more specific needs pre-creating there.
-# .cache/huggingface holds bge-m3's downloaded weights (Phase 2) — pre-created
-# so the bind-mounted host directory doesn't get root ownership by default.
-RUN mkdir -p /home/appuser/app/data /home/appuser/.cache/huggingface \
-    && chown -R appuser:appuser /home/appuser/app/data /home/appuser/.cache
+# (chunks/indexes/evals, rag.db, documents/{owner}/{doc}/) are created on
+# demand by the app itself (mkdir(parents=True, exist_ok=True) at each write
+# site), so nothing more specific needs pre-creating there.
+RUN mkdir -p /home/appuser/app/data \
+    && chown -R appuser:appuser /home/appuser/app/data
+
+# Model weights, baked in by the models stage. --chown during COPY rather than a
+# following chown -R: a separate ownership pass rewrites every file into a new
+# layer, which would put ~2.3GB into the image twice.
+COPY --from=models --chown=appuser:appuser /opt/models /opt/models
+
+# Point every loader at the baked copies. NOT ~/.cache/huggingface, which
+# docker-compose bind-mounts for local dev — a mount there hides whatever the
+# image shipped and sends the app back to downloading at runtime. FLASHRANK_CACHE_DIR
+# likewise overrides a default of data/flashrank_cache, which lands on the Azure
+# Files share in production and is slow to read.
+#
+# HF_HUB_CACHE (not HF_HOME) is the one that must match: fetch_models.py passes
+# cache_dir=/opt/models/hf, and HF_HOME would imply a cache at $HF_HOME/hub —
+# one directory deeper than where the files actually are, so nothing would be
+# found. sentence-transformers reads SENTENCE_TRANSFORMERS_HOME as its
+# cache_folder, which it forwards as that same cache_dir.
+ENV HF_HUB_CACHE=/opt/models/hf \
+    SENTENCE_TRANSFORMERS_HOME=/opt/models/hf \
+    FLASHRANK_CACHE_DIR=/opt/models/flashrank
 
 USER appuser
 WORKDIR /home/appuser/app
+
+# Prove the bake actually resolves, with the network forced off. A wrong cache
+# path fails silently at runtime — the app just downloads again, which is the
+# exact behaviour this is meant to remove — so it is worth catching in the
+# build. Sits above the code COPYs so it stays cached across ordinary commits.
+RUN HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -c "\
+from sentence_transformers import SentenceTransformer; \
+m = SentenceTransformer('BAAI/bge-m3', device='cpu'); \
+v = m.encode(['offline bake check'], normalize_embeddings=True); \
+print('bge-m3 loaded offline from image, dim =', len(v[0]))"
 
 # Copy application code
 COPY --chown=appuser:appuser APP/ ./APP/

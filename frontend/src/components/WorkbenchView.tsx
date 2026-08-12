@@ -73,7 +73,7 @@ export function WorkbenchView() {
   const params = useSearchParams()
   const { ready } = useRequireAuth()
   const documentId = params.get('doc')
-  const { health, isConnected } = useHealth()
+  const { health, isConnected, waking } = useHealth()
   const { setBusy } = useActivity()
   const { flash, announce } = useToast()
   const { motionOff } = useUiPrefs()
@@ -85,6 +85,11 @@ export function WorkbenchView() {
   const [thinkingIdx, setThinkingIdx] = useState(0)
   const [typed, setTyped] = useState(0)
   const [pipeStage, setPipeStage] = useState(-1)
+  // Which turn the reveal animation is currently walking through, if any.
+  // Deliberately explicit: inferring it from "is this the newest turn" made
+  // every restored conversation render its most recent answer as an empty
+  // string, because `typed` starts at 0 and no timer ever runs for history.
+  const [typingTurnId, setTypingTurnId] = useState<string | null>(null)
   const [focus, setFocus] = useState<CitationFocus | null>(null)
   const [refreshToken, setRefreshToken] = useState(0)
   const [byoKey, setByoKey] = useState('')
@@ -147,17 +152,17 @@ export function WorkbenchView() {
     return () => controller.abort()
   }, [documentId, ready])
 
-  const latestId = transcript.at(-1)?.id ?? null
-
   const startTyping = useCallback(
-    (answer: string) => {
+    (turnId: string, answer: string) => {
       if (motionOff) {
+        setTypingTurnId(null)
         setTyped(answer.length)
         return
       }
 
       if (typeTimer.current) clearInterval(typeTimer.current)
       setTyped(0)
+      setTypingTurnId(turnId)
       const step = Math.max(2, Math.round(answer.length / 90))
       typeTimer.current = setInterval(() => {
         setTyped((current) => {
@@ -165,6 +170,9 @@ export function WorkbenchView() {
           if (next >= answer.length) {
             if (typeTimer.current) clearInterval(typeTimer.current)
             typeTimer.current = null
+            // Released here rather than left to the render: once the reveal is
+            // complete the turn is just another finished answer.
+            setTypingTurnId(null)
             return answer.length
           }
           return next
@@ -201,6 +209,9 @@ export function WorkbenchView() {
     setQuerying(true)
     setThinkingIdx(0)
     setTyped(0)
+    // Resetting `typed` without releasing the previous turn would blank an
+    // answer that is still mid-reveal until the new one arrives.
+    setTypingTurnId(null)
     setPipeStage(0)
     setFocus(null)
     setBusy('querying')
@@ -228,7 +239,7 @@ export function WorkbenchView() {
       })
       setPipeStage(MAX_PIPE_STAGE)
       announce(`Answer ready with ${sources.length} sources.`)
-      startTyping(result.answer)
+      startTyping(id, result.answer)
     } catch (err) {
       const apiErr = err instanceof ApiError ? err : null
       const notIngested = apiErr?.isNotIngested ?? false
@@ -259,16 +270,25 @@ export function WorkbenchView() {
 
   const renderAnswer = (turn: Turn) => {
     const full = turn.answer ?? ''
-    const stillTyping = turn.id === latestId && Boolean(full) && typed < full.length
+    const stillTyping = turn.id === typingTurnId && Boolean(full) && typed < full.length
     const visibleAnswer = stillTyping ? full.slice(0, typed) : full
 
     return (
       <div className="space-y-3">
-        <div className="flex flex-wrap items-center gap-2 text-[12px] opacity-55">
-          <span className="font-extrabold uppercase tracking-[0.12em]">{turn.model ?? 'unknown model'}</span>
-          <span>·</span>
-          <Mono className="text-[11.5px]">request {turn.requestId?.slice(0, 8) ?? '—'}</Mono>
-        </div>
+        {/* Restored turns carry no model or request id — those exist only on a
+            live response — so the line is dropped rather than filled with
+            "unknown model · request —". */}
+        {turn.model && (
+          <div className="flex flex-wrap items-center gap-2 text-[12px] opacity-55">
+            <span className="font-extrabold uppercase tracking-[0.12em]">{turn.model}</span>
+            {turn.requestId && (
+              <>
+                <span>·</span>
+                <Mono className="text-[11.5px]">request {turn.requestId.slice(0, 8)}</Mono>
+              </>
+            )}
+          </div>
+        )}
 
         {/* Answers are Markdown. Citations are rewritten to links on a `cite:`
             scheme first, so one parse covers the whole answer — splitting the
@@ -358,21 +378,38 @@ export function WorkbenchView() {
         {!connected && (
           <Panel className="max-w-[440px]">
             <div className="p-5">
-              <div className="mb-2 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
-                Backend unavailable
+              {/* A cold start is the ordinary case here, not a fault: the
+                  backend scales to zero when idle to keep it free to run.
+                  Calling that "unavailable" reads as broken, so it only says so
+                  once the wake has taken longer than one plausibly can. */}
+              <div className="mb-2 flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
+                {waking && <Spinner size={12} />}
+                {waking ? 'Waking the backend' : 'Backend unavailable'}
               </div>
               <div className="text-[14px] leading-[1.55] opacity-75">
-                Waiting for backend on <span className="font-extrabold">{API_BASE_URL}</span>.
-                The workbench will activate automatically once /health reports ok.
+                {waking ? (
+                  <>
+                    It scales to zero when idle, so the first visit after a quiet
+                    spell takes about half a minute to start. This page connects
+                    itself the moment it is ready — nothing to do.
+                  </>
+                ) : (
+                  <>
+                    Still no response from <span className="font-extrabold">{API_BASE_URL}</span>.
+                    The workbench activates automatically once /health reports ok.
+                  </>
+                )}
               </div>
-              <div className="mt-4 flex flex-wrap gap-3">
-                <Link href="/setup">
-                  <Button variant="ghost">Back to setup</Button>
-                </Link>
-                <Button variant="chip" onClick={() => flash('Check the setup page for the next step')}>
-                  What now?
-                </Button>
-              </div>
+              {!waking && (
+                <div className="mt-4 flex flex-wrap gap-3">
+                  <Link href="/setup">
+                    <Button variant="ghost">Back to setup</Button>
+                  </Link>
+                  <Button variant="chip" onClick={() => flash('Check the setup page for the next step')}>
+                    What now?
+                  </Button>
+                </div>
+              )}
             </div>
           </Panel>
         )}

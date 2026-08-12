@@ -108,8 +108,14 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
             ${{ env.IMAGE }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # Registry cache rather than type=gha. The image now carries a ~2.3GB
+          # baked-model layer on top of torch, and GitHub's Actions cache is
+          # capped near 10GB per repo with LRU eviction — under mode=max that
+          # thrashes, the model layer gets evicted, and every build re-downloads
+          # the weights, defeating the bake. GHCR has no such cap and already
+          # hosts the image being pushed.
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 
   deploy:
     name: Deploy to ${{ needs.resolve.outputs.env_name }}

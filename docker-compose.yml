@@ -61,14 +61,14 @@ services:
     volumes:
       # Single mount covering data/rag.db (SQLite metadata/auth store) and
       # data/documents/{owner_id}/{document_id}/ (per-document BM25 pickles) —
-      # both new in Phase 1 — alongside the pre-existing chunks/indexes/evals/
-      # flashrank_cache subpaths, instead of enumerating each subpath by hand.
+      # both new in Phase 1 — alongside the pre-existing chunks/indexes/evals
+      # subpaths, instead of enumerating each subpath by hand.
       - ./data:/home/appuser/app/data
-      # Phase 2: bge-m3's ~2GB of weights download from Hugging Face on first
-      # use (lazy — only when /ingest or /query is actually called, not at
-      # startup). Without this mount, that download repeats on every
-      # container recreate; with it, it survives rebuilds.
-      - ./data/hf_cache:/home/appuser/.cache/huggingface
+      # There is deliberately NO mount for the model cache any more. bge-m3 and
+      # the flashrank ranker are baked into the image at /opt/models, so nothing
+      # downloads at runtime. The old mount pointed at ~/.cache/huggingface,
+      # which would now shadow the baked weights and reintroduce the download it
+      # was added to avoid.
     networks:
       - rag-net
 

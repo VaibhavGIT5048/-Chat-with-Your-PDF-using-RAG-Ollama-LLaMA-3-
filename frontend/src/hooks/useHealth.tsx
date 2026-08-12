@@ -17,7 +17,7 @@ import {
 import { usePathname } from 'next/navigation'
 
 import { POLL_MS, STORAGE_KEYS } from '@/config'
-import { getHealth } from '@/services/api'
+import { getHealth, warmup } from '@/services/api'
 import type { HealthState, HealthStatus } from '@/types/api'
 
 interface HealthContextValue {
@@ -29,9 +29,17 @@ interface HealthContextValue {
   everConnected: boolean
   /** Backend was connected, then stopped responding. */
   reconnecting: boolean
+  /** Offline, but recently enough that a scale-to-zero wake is the likely
+   *  explanation. Drives "waking up" copy instead of "unavailable" — after the
+   *  window passes it flips back, because a wake that never finishes is an
+   *  outage and saying otherwise would be misleading. */
+  waking: boolean
   isConnected: boolean
   checkNow: () => void
 }
+
+/** A cold start is typically well under a minute; past this it is not a wake. */
+const WAKING_WINDOW_MS = 90_000
 
 const HealthContext = createContext<HealthContextValue | null>(null)
 
@@ -42,6 +50,7 @@ export function HealthProvider({ children }: { children: ReactNode }) {
   const [attempts, setAttempts] = useState(0)
   const [lastCheckedAt, setLastCheckedAt] = useState<number | null>(null)
   const [everConnected, setEverConnected] = useState(false)
+  const [offlineSince, setOfflineSince] = useState<number | null>(null)
 
   // Poll cadence depends on the route; keep it in a ref so the loop can read the
   // current value without being torn down and recreated on every navigation.
@@ -52,6 +61,11 @@ export function HealthProvider({ children }: { children: ReactNode }) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(true)
+  // `poll` is memoised with no deps so the loop is never torn down; reading the
+  // current state through a ref keeps the cold/warm and cadence decisions
+  // correct without putting `state` in that dependency list.
+  const stateRef = useRef<HealthState>('checking')
+  stateRef.current = state
 
   useEffect(() => {
     try {
@@ -61,6 +75,15 @@ export function HealthProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // Start the wake as early as the app loads, not on reaching /home. The models
+  // take longer to load than the container takes to start, so the sooner this
+  // is kicked off the more of it overlaps with the user signing in or reading
+  // the page — which is the whole point. Fire-and-forget: it returns 202
+  // immediately and failure is handled by the poller below.
+  useEffect(() => {
+    void warmup()
+  }, [])
+
   const poll = useCallback(async () => {
     abortRef.current?.abort()
     const controller = new AbortController()
@@ -68,10 +91,14 @@ export function HealthProvider({ children }: { children: ReactNode }) {
 
     setAttempts((n) => n + 1)
     try {
-      const body = await getHealth(controller.signal)
+      // Treat "not currently connected" as possibly-waking and give the request
+      // the long budget. Only a probe against a backend we know is up gets the
+      // short one, so a genuine outage is still noticed quickly.
+      const body = await getHealth(controller.signal, stateRef.current !== 'ok')
       if (!mountedRef.current) return
       setHealth(body)
       setState(body.status === 'ok' ? 'ok' : 'degraded')
+      if (body.status === 'ok') setOfflineSince(null)
       setLastCheckedAt(Date.now())
       if (body.status === 'ok') {
         setEverConnected(true)
@@ -85,6 +112,9 @@ export function HealthProvider({ children }: { children: ReactNode }) {
       if (!mountedRef.current) return
       setHealth(null)
       setState('offline')
+      // Stamp only the transition into offline, so the "waking" window is
+      // measured from when contact was lost rather than from each retry.
+      setOfflineSince((current) => current ?? Date.now())
       setLastCheckedAt(Date.now())
     }
   }, [])
@@ -98,7 +128,10 @@ export function HealthProvider({ children }: { children: ReactNode }) {
     const tick = async () => {
       await poll()
       if (stopped) return
-      timerRef.current = setTimeout(tick, intervalRef.current)
+      // Offline: check back quickly so a finished wake is picked up promptly
+      // rather than sitting behind a 20s tick.
+      const delay = stateRef.current === 'ok' ? intervalRef.current : POLL_MS.offline
+      timerRef.current = setTimeout(tick, delay)
     }
     tick()
 
@@ -129,10 +162,14 @@ export function HealthProvider({ children }: { children: ReactNode }) {
       lastCheckedAt,
       everConnected,
       reconnecting: state === 'offline' && everConnected,
+      waking:
+        state === 'offline' &&
+        offlineSince !== null &&
+        (lastCheckedAt ?? 0) - offlineSince < WAKING_WINDOW_MS,
       isConnected: state === 'ok',
       checkNow,
     }),
-    [health, state, attempts, lastCheckedAt, everConnected, checkNow],
+    [health, state, attempts, lastCheckedAt, everConnected, offlineSince, checkNow],
   )
 
   return <HealthContext.Provider value={value}>{children}</HealthContext.Provider>

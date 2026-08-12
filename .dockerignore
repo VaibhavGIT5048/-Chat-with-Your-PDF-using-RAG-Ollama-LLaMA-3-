@@ -31,6 +31,9 @@ README.md
 docker-compose.yml
 docker/
 !docker/frontend-nginx.conf
+# fetch_models.py runs during the build (it downloads the weights that get baked
+# into the image), so unlike the rest of docker/ it has to reach the context.
+!docker/fetch_models.py
 
 # Frontend build artifacts and dependencies are recreated in the Docker build
 frontend/node_modules/

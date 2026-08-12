@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -19,6 +20,7 @@ from slowapi.util import get_remote_address
 from APP import auth, db, jobs
 from APP.auth import email as otp_email
 from APP.rag.service import RAGService
+from APP.rag.vector_store import warm_reranker
 from APP.auth import get_current_user
 from APP.jobs import job_store
 from APP.schemas import (
@@ -83,6 +85,10 @@ structlog.configure(
     cache_logger_on_first_use=True,
 )
 logger = structlog.get_logger("rag_api")
+
+# Serialises the check-and-set in /warmup so concurrent callers can't each
+# start their own model load.
+_warmup_lock = threading.Lock()
 
 
 @asynccontextmanager
@@ -200,6 +206,54 @@ def create_app() -> FastAPI:
     async def health(request: Request) -> HealthStatus:
         service = get_service(request)
         return service.health()
+
+    @app.post("/warmup", status_code=202)
+    async def warmup(request: Request) -> dict:
+        """Pulls the embedding model and reranker into memory ahead of the first
+        question.
+
+        The app runs at minReplicas=0, so an idle period drops the replica and
+        the next visitor pays a cold start. /health says nothing about that — it
+        touches no model — so before this endpoint existed the entire model-load
+        cost landed on whoever asked the first question. Called when the UI
+        mounts, it spends that time while the page is being read instead.
+
+        Returns immediately rather than blocking: the caller only needs the work
+        started, and a request held open for a model load is exactly the kind of
+        thing the ingress times out.
+        """
+        service = get_service(request)
+        state = request.app.state
+
+        # Unauthenticated by design — it has to be callable before sign-in, and
+        # on the sign-in page is exactly when starting the wake is most useful.
+        # That makes the guard necessary rather than tidy: without it every
+        # request would spawn a thread, and a page refreshed a few times would
+        # have several model loads racing each other.
+        with _warmup_lock:
+            if getattr(state, "warm", False):
+                return {"status": "warm"}
+            if getattr(state, "warming", False):
+                return {"status": "warming"}
+            state.warming = True
+
+        def _warm() -> None:
+            try:
+                service.embedding_provider.embed_query("warmup")
+                warm_reranker()
+                state.warm = True
+                logger.info("warmup_complete")
+            except Exception:
+                # Best-effort: a failed warmup must not affect real requests,
+                # which load the same models lazily anyway.
+                logger.exception("warmup_failed")
+            finally:
+                # Cleared either way, so a failed attempt can be retried rather
+                # than latching the app into "warming" forever.
+                state.warming = False
+
+        threading.Thread(target=_warm, name="warmup", daemon=True).start()
+        return {"status": "warming"}
 
     @app.get("/ready", response_model=HealthStatus)
     async def ready(request: Request) -> HealthStatus:

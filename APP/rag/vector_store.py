@@ -137,15 +137,40 @@ class QdrantVectorStore:
 _flashrank_ranker = None
 
 
-def flashrank_rerank(query: str, candidates: list[Document], k: int = 5) -> list[Document]:
-    if Ranker is None or RerankRequest is None or not candidates:
-        return candidates[:k]
+def _get_ranker():
+    """Builds the ranker once, on first use.
 
+    The cache dir is where the ranker's weights live. In the deployed image
+    FLASHRANK_CACHE_DIR points at the baked copy under /opt/models; the default
+    below is the local-dev path and sits under data/, which is the Azure Files
+    share in production — slow to read, and the reason the env var is set.
+    """
     global _flashrank_ranker
     if _flashrank_ranker is None:
         cache_dir = os.getenv("FLASHRANK_CACHE_DIR", "data/flashrank_cache")
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         _flashrank_ranker = Ranker(cache_dir=cache_dir)
+    return _flashrank_ranker
+
+
+def warm_reranker() -> bool:
+    """Loads the ranker ahead of the first query. Returns whether it is ready.
+
+    Separate from flashrank_rerank because that one short-circuits on empty
+    candidates and so never reaches the constructor — warming through it would
+    silently do nothing.
+    """
+    if Ranker is None or RerankRequest is None:
+        return False
+    _get_ranker()
+    return True
+
+
+def flashrank_rerank(query: str, candidates: list[Document], k: int = 5) -> list[Document]:
+    if Ranker is None or RerankRequest is None or not candidates:
+        return candidates[:k]
+
+    ranker = _get_ranker()
 
     passages = []
     for idx, doc in enumerate(candidates):
@@ -156,7 +181,7 @@ def flashrank_rerank(query: str, candidates: list[Document], k: int = 5) -> list
         })
 
     request = RerankRequest(query=query, passages=passages)
-    ranked = _flashrank_ranker.rerank(request)
+    ranked = ranker.rerank(request)
     top_docs = []
     for item in ranked[:k]:
         index = int(item["id"]) if isinstance(item, dict) and "id" in item else int(getattr(item, "id", 0))

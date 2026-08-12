@@ -10,7 +10,7 @@ import { FileText, Plus, Trash2 } from 'lucide-react'
 
 import { useAuth, useRequireAuth } from '@/hooks/useAuth'
 import { useToast } from '@/hooks/useToast'
-import { ApiError, deleteDocument, listDocuments, warmup } from '@/services/api'
+import { ApiError, deleteDocument, listDocuments } from '@/services/api'
 import type { DocumentSummary } from '@/types/api'
 import { Button, Eyebrow, Mono, Panel, PanelHeader, Spinner } from '@/components/ui'
 
@@ -32,12 +32,8 @@ export function HomeView() {
   const [error, setError] = useState<string | null>(null)
   const [deleting, setDeleting] = useState<string | null>(null)
 
-  // The backend scales to zero, so the first request after idle pays a cold
-  // start. Firing it on mount spends that during the seconds spent reading
-  // this page rather than after the next click.
-  useEffect(() => {
-    if (ready) void warmup()
-  }, [ready])
+  // Warmup now fires once app-wide from HealthProvider, which happens earlier
+  // than reaching this page — so there is deliberately no call here.
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
