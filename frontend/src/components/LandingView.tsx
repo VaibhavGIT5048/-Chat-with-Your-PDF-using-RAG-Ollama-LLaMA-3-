@@ -87,7 +87,7 @@ export function LandingView() {
 
   return (
     <main className="relative z-10">
-      <section className="mx-auto max-w-[1180px] px-[26px] pb-16 pt-[90px]">
+      <section className="mx-auto max-w-[1180px] px-[26px] pb-8 pt-[90px]">
         <Eyebrow className="mb-[26px]">Private, grounded document answers</Eyebrow>
         <h1 className="m-0 mb-[26px] max-w-[15ch] text-[clamp(44px,7vw,92px)] font-extrabold leading-[0.95] tracking-[-0.035em]">
           Ask questions of any PDF.
@@ -115,7 +115,7 @@ export function LandingView() {
           {HERO_STATS.map((s) => (
             <div
               key={s.k}
-              className="py-[26px] pr-[26px]"
+              className="py-4 pr-[26px]"
               style={{ borderRight: 'var(--brd-w) solid var(--brd)' }}
             >
               <div className="tnum text-[32px] font-extrabold tracking-[-0.03em]">{s.v}</div>

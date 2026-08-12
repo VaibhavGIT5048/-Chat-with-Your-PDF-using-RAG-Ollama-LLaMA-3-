@@ -211,7 +211,8 @@ Realistic applications, with the reason RAG specifically fits:
         ▲
         │  (optional cache tier, in front of the Azure Files read)
    ┌─────────────────────┐
-   │ UPSTASH REDIS       │  ← code complete; REDIS_URL not yet set
+   │ UPSTASH REDIS       │  ← live on both environments (Mumbai,
+   │ (ap-south-1)        │     ap-south-1 — same region as the backend)
    └─────────────────────┘
 
 Embeddings (bge-m3) run IN-PROCESS inside the FastAPI container — there is no
@@ -831,8 +832,18 @@ WHY QDRANT SPECIFICALLY:
     never retrieve another user's document.
   * Written in Rust; predictable performance and memory.
 
-WHAT WE STORE. One shared collection (`chunks_collection_v2_staging` for dev),
-vector size 1024, cosine distance. Each point: id = uuid5(document_id,
+WHAT WE STORE. One shared collection per environment —
+`chunks_collection_v2_staging` for dev and `chunks_collection_v2` for
+production — vector size 1024, cosine distance.
+
+A NOTE ON THE PRODUCTION COLLECTION NAME. Production originally pointed at
+`chunks_collection`, which was created at vector size 1536 for
+text-embedding-3-small. A Qdrant collection's vector size is FIXED at creation,
+so this was not a matter of which model is used going forward: upserting
+1024-dimension bge-m3 vectors into it would have been rejected outright on
+dimension mismatch. Production was therefore moved to a new collection, which
+the app creates on first ingest with the correct size and payload indexes. The
+old collection is left in place, holding its two original points. Each point: id = uuid5(document_id,
 chunk_index); vector = the bge-m3 embedding; payload = {text, metadata (source,
 page, section, chunk_id), document_id, owner_id}.
 
@@ -932,8 +943,17 @@ callers — then RLS policies, then cutover.
 
 5.4 REDIS / UPSTASH — THE CACHE TIER
 --------------------------------------------------------------------------------
-STATUS: CODE COMPLETE AND DEPLOYED; REDIS_URL not yet set, so it currently
-degrades cleanly to the disk path.
+STATUS: LIVE ON BOTH ENVIRONMENTS. An Upstash free-tier database (256MB, 10GB
+monthly bandwidth) in Mumbai (ap-south-1) — the same region as the Container
+Apps backend, so the extra hop is short. The connection string is stored as a
+Container App secret (`redis-url`) and referenced via secretRef on both
+rag-api-staging and rag-api.
+
+ONE DETAIL THAT MATTERS WHEN CONFIGURING IT: the scheme must be `rediss://`,
+not `redis://`. redis-py negotiates TLS from the URL scheme, whereas the
+`redis-cli` connection string Upstash displays uses `redis://` with a separate
+`--tls` flag. Copying that string verbatim yields a client that tries to speak
+plaintext to a TLS-only endpoint.
 
 THE PROBLEM IT SOLVES. Every single query re-read that document's `bm25.pkl`
 off the Azure Files SMB share before retrieval could even start. That is a
@@ -1845,11 +1865,6 @@ on student credit, with:
   * Cold starts of roughly 20-40 seconds after idle remain, though the
     multi-gigabyte download has been eliminated.
   * OTP emails land in spam (accepted trade-off, section 6.4).
-  * Production still runs pre-Phase-1 code and has not yet received the file
-    share, nobrl mount, or payload-index fixes — it would fail exactly as
-    staging did if promoted as-is.
-  * Redis is deployed in code but REDIS_URL is not yet set, so the cache
-    currently operates in its degraded (disk-only) mode.
   * INT8 ONNX quantization is implemented but unvalidated on x86.
   * No PII detection yet.
 
@@ -1861,7 +1876,6 @@ IMMEDIATE (unblocks horizontal scale):
      the SQLite file and the in-process cache — and the cache was deliberately
      designed with Redis as tier 2 precisely so that multiple replicas can
      share it.
-  3. Set REDIS_URL to activate the cache tier that already exists.
 
 MEDIUM TERM:
   4. Move BM25 indexes off the SMB share. Qdrant supports sparse vectors
@@ -2601,12 +2615,11 @@ A.8 PREREQUISITES — EXTERNAL ACCOUNTS AND RESOURCES
 --------------------------------------------------------------------------------
 A.9 CURRENT OPEN TODOS (as of this document)
 --------------------------------------------------------------------------------
-  [TODO] Set REDIS_URL on rag-api-staging to activate the cache tier that is
-         already deployed in code
-  [TODO] Promote to production — `main` still runs pre-Phase-1 code and has
-         received NONE of the staging fixes (the file share, the nobrl mount,
-         the Qdrant payload indexes). It will crash-loop or 500 exactly as
-         staging did if promoted as-is.
+  [DONE] REDIS_URL set on BOTH rag-api-staging and rag-api, activating the
+         cache tier. Credentials verified over TLS (AUTH/PING/SET/GET/DEL)
+         before being stored as a secret.
+  [DONE] Promoted to production. See A.10 for what had to be fixed first and
+         what the promotion actually involved.
   [TODO] Supabase Postgres migration (database only), unblocking maxReplicas > 1
   [TODO] PII detection and redaction (section 7.6)
   [TODO] Postgres row-level security, with the Supabase migration (section 7.7)
@@ -2616,7 +2629,67 @@ A.9 CURRENT OPEN TODOS (as of this document)
   [TODO] Repository rename to `grounded-rag`
 
 --------------------------------------------------------------------------------
-A.10 CRITICAL FILES (the map the plan was executed against)
+A.10 THE PRODUCTION PROMOTION — WHAT IT ACTUALLY TOOK
+--------------------------------------------------------------------------------
+Production ran pre-Phase-1 code for the whole of this project's development,
+deliberately, while everything was exercised on dev. Promoting it was not a
+matter of merging a branch: the environment itself had drifted far enough that
+deploying the new image onto it as-configured would have crash-looped it.
+
+WHAT WAS WRONG WITH PRODUCTION BEFORE THE PROMOTION, all found by inspection
+rather than by attempting the deploy and watching it fail:
+
+  1. NO `nobrl` MOUNT OPTION. Its volume had NO mountOptions at all. This was
+     survivable only because the old code never touched SQLite; the current
+     code keeps its auth database on that SMB share, and SQLite's byte-range
+     locks cannot be honoured there. This is precisely the fault that
+     crash-looped staging.
+
+  2. ONLY EIGHT ENVIRONMENT VARIABLES. Production predated authentication, the
+     provider abstraction and the parser router, so it had none of
+     JWT_SECRET_KEY, the ACS pair, the GitHub/Google OAuth pairs, or the
+     AZURE_OPENAI trio. Without the last of those, /health reports `degraded`
+     and the deploy workflow's own smoke test fails the run.
+
+  3. A VECTOR COLLECTION OF THE WRONG DIMENSION — `chunks_collection` at 1536
+     (see 5.1).
+
+THE PROMOTION SEQUENCE:
+  a. scripts/configure_production.sh — verifies the file share exists (exiting
+     non-zero if not), sets five secrets, sets thirteen environment variables,
+     and patches the volume to add nobrl.
+  b. Every one of those verified by reading back the live configuration.
+  c. develop merged into main (27 commits).
+  d. CI on main: backend tests, frontend typecheck, Docker build — all green.
+     The Docker build took ~10 minutes because main was building the
+     model-baking stage for the first time and had no cache to hit.
+  e. Backend deploy dispatched with target=production.
+  f. Frontend workflow dispatched MANUALLY — see the gotcha below.
+  g. Verified against the running system: revision Healthy, 18 routes live on
+     /openapi.json, /health reporting ok on chunks_collection_v2, the embedding
+     model loading from /opt/models/bge-m3 in ~2 seconds with ZERO
+     huggingface.co calls, and the deployed prod bundle containing the new
+     frontend code and pointing at the prod backend.
+
+TWO THINGS WORTH RECORDING FROM THE PROMOTION ITSELF:
+
+  * THE FRONTEND WORKFLOW DOES NOT TRIGGER ON A PUSH TO `main`. Its trigger is
+    `push: branches: [develop]`. Production is BUILT FROM main, but only when
+    the workflow runs — so merging to main updates the source of the prod build
+    without rebuilding it. The site kept serving the previous bundle until the
+    workflow was dispatched by hand. This is a direct consequence of the
+    one-artifact-per-repository constraint in 9.7, and is the kind of thing
+    that reads as "the deploy silently didn't work" if you do not know it.
+
+  * THE CONFIGURE SCRIPT FAILED ON ITS FIRST RUN, CORRECTLY. It conflated the
+    managed environment's storage REGISTRATION name (`rag-data-storage`) with
+    the Azure Files SHARE name it points at (`rag-data`) — two different things
+    that are easy to confuse. It exited non-zero and named the problem, which
+    is exactly the behaviour its staging predecessor lacked when it reported
+    success against a share that did not exist.
+
+--------------------------------------------------------------------------------
+A.11 CRITICAL FILES (the map the plan was executed against)
 --------------------------------------------------------------------------------
   APP/main.py               auth dependency, asyncio.to_thread, /auth/* and
                             /documents* routes, middleware ordering, /warmup
@@ -2680,8 +2753,8 @@ THE FIVE WORKSTREAMS
      stage (section 9.2).
   3. [DONE] A warmup that actually warms (POST /warmup) plus honest cold-start
      UI.
-  4. [PART] Two-tier document-artifact cache — code complete and deployed;
-     REDIS_URL not yet set.
+  4. [DONE] Two-tier document-artifact cache — code complete, deployed, and
+     REDIS_URL now set on both environments.
   5. [DONE] Per-stage millisecond timings in answer(), so "queries feel slow"
      becomes actionable data rather than an impression.
 
