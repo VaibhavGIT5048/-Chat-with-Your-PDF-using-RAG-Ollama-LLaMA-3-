@@ -23,6 +23,9 @@ TABLE OF CONTENTS
 ================================================================================
 
   1.  PROJECT OVERVIEW — WHAT, WHY, USE CASES
+      1.1  What we are building
+      1.2  Why we are building it
+      1.3  Use cases
   2.  SYSTEM ARCHITECTURE AT A GLANCE
   3.  THE BACKEND IN DETAIL
       3.1  The RAG pipeline, stage by stage
@@ -44,10 +47,50 @@ TABLE OF CONTENTS
       5.4  Redis / Upstash — the cache tier
       5.5  Azure Files — the shared volume
   6.  CLOUD INFRASTRUCTURE — MICROSOFT AZURE
+      6.1  The student credit constraint
+      6.2  Azure services in use
+      6.3  Cold starts — the real cost of scaling to zero
+      6.4  Email deliverability — an accepted limitation
   7.  RAG SECURITY
+      7.1  Prompt injection — the central threat (three defence layers)
+      7.2  Authentication and authorisation — JWT, OAuth 2.0, OTP, bcrypt
+      7.3  Rate limiting and abuse control
+      7.4  Tenant isolation — the most important property
+      7.5  Transport, headers and secrets
+      7.6  PLANNED — PII detection and redaction
+      7.7  PLANNED — Postgres row-level security (RLS)
+      7.8  PLANNED — LLM firewall / gateway
   8.  RAG EVALUATION AND METRICS (RAGAS)
-  9.  CI/CD AND DEPLOYMENT
+      8.1  Why RAG needs its own evaluation discipline
+      8.2  RAGAS — what it is
+      8.3  The four metrics we measure
+      8.4  Evaluation beyond RAGAS, already performed
+      8.5  Future scope — LangSmith and continuous evaluation
+  9.  DEPLOYMENT, DOCKER, AND CI/CD
+      9.1  Deployment research — every option evaluated, and the verdicts
+      9.2  Why Azure Container Apps won, and what it cost us
+      9.3  Frontend hosting — including the detour we took and reverted
+      9.4  Vector database hosting research
+      9.5  Docker — image design decisions
+      9.6  Local development with Docker Compose
+      9.7  The CI/CD pipeline
+      9.8  Build cache design
+      9.9  Deployment verification, rollback, and incidents
   10. CONCLUSION, SCALING, AND FUTURE SCOPE
+      10.1 What was actually achieved
+      10.2 Current limitations — stated plainly
+      10.3 How to scale this further
+      10.4 Closing note
+  11. REFERENCES AND SOURCES
+      11.1 Foundational papers — RAG and retrieval
+      11.2 Papers — embeddings, ranking, and indexing
+      11.3 Papers — evaluation and long-context behaviour
+      11.4 Security references
+      11.5 Official documentation
+      11.6 Community writing, blogs, and practitioner sources
+      11.7 Benchmarks, leaderboards, and model cards
+      11.8 Investigative commands — how facts were established
+      11.9 A note on how sources were used
 
 
 ================================================================================
@@ -1423,26 +1466,271 @@ concern that self-hosted embeddings were chosen to avoid.
 
 
 ================================================================================
-9. CI/CD AND DEPLOYMENT
+9. DEPLOYMENT, DOCKER, AND CI/CD
 ================================================================================
 
-9.1 THE PIPELINE
+9.1 DEPLOYMENT RESEARCH — EVERY OPTION EVALUATED, AND THE VERDICTS
+--------------------------------------------------------------------------------
+Deployment was not a default. Each layer of the stack was researched against a
+specific set of constraints, and the constraints are what make the verdicts
+make sense:
+
+  CONSTRAINT A — A HARD $0/MONTH TARGET. The budget is $100 of Azure student
+    credit with no card attached. Anything billed continuously consumes the
+    entire budget regardless of whether a single person uses the app.
+  CONSTRAINT B — THE WORKLOAD IS SPIKY AND MOSTLY IDLE. A portfolio/dev
+    deployment sits unused for hours, then does something CPU-heavy for a
+    minute. Paying for idle is paying for nothing.
+  CONSTRAINT C — LARGE MEMORY FOOTPRINT. The container holds a 2.3GB embedding
+    model in RAM. This immediately eliminates most "free tier" PaaS options,
+    which cap at 512MB.
+  CONSTRAINT D — LONG-RUNNING REQUESTS. Ingest can take minutes.
+  CONSTRAINT E — PERSISTENT STORAGE for SQLite and BM25 indexes across
+    restarts.
+
+BACKEND HOSTING — OPTIONS EVALUATED:
+
+  * AZURE CONTAINER APPS — ✅ CHOSEN. See 9.2.
+
+  * AZURE APP SERVICE — REJECTED. The Linux free tier (F1) caps at 1GB RAM,
+    which cannot hold bge-m3, and does not support custom containers on the
+    free plan. The paid tier (B1) that would work is billed continuously,
+    violating constraint A.
+
+  * AZURE KUBERNETES SERVICE (AKS) — REJECTED. The control plane is free but
+    the node pool is not, and nodes are billed 24/7. Enormous operational
+    complexity — ingress controllers, cert-manager, HPA tuning — for a
+    single-container application. Correct answer at a scale this project is
+    nowhere near.
+
+  * AZURE FUNCTIONS (serverless) — REJECTED, and instructively so. It scales to
+    zero, which fits perfectly. But the Consumption plan enforces a hard
+    execution timeout (default 5 minutes, max 10) which conflicts with
+    constraint D, memory caps below what the embedding model needs
+    (constraint C), and — decisively — a per-invocation execution model means
+    the 2.3GB model would be loaded on a cold start with no guarantee the next
+    invocation reuses the same warm instance. Loading a 2.3GB model per
+    invocation is architecturally wrong for this workload.
+
+  * AZURE CONTAINER INSTANCES (ACI) — REJECTED. Genuinely simple, but it has no
+    scale-to-zero: a container group runs until you stop it and is billed per
+    second the whole time. It is a good fit for batch jobs, not a web API that
+    must be reachable but is usually idle.
+
+  * RENDER / RAILWAY / FLY.IO — REJECTED, though these were serious candidates.
+    Render's free web services sleep after inactivity (which we want) but cap
+    at 512MB RAM (constraint C, fatal). Railway moved to a usage-based model
+    with a small monthly credit that a 4GB-RAM service exhausts quickly. Fly.io
+    genuinely supports scale-to-zero with `auto_stop_machines` and would have
+    worked technically — the deciding factor was that the project already had
+    $100 of Azure credit that could not be spent anywhere else, and using it
+    was strictly better than spending real money elsewhere.
+
+  * SELF-HOSTING ON A VPS — REJECTED. A $5/month VPS is real money billed
+    continuously, and it moves TLS certificates, OS patching, process
+    supervision, and log rotation into scope for no benefit at this scale.
+
+  * HUGGING FACE SPACES — REJECTED for the primary API. The free CPU tier is
+    attractive and would hold the model, but Spaces is optimised around
+    Gradio/Streamlit demo apps, sleeps aggressively, and offers no persistent
+    writable volume suitable for SQLite. Worth revisiting purely as a public
+    demo mirror.
+
+9.2 WHY AZURE CONTAINER APPS WON, AND WHAT IT COST US
+--------------------------------------------------------------------------------
+WHAT IT IS. A serverless container platform built on Kubernetes and KEDA, with
+the Kubernetes hidden. You supply an image and a scale rule; it runs the
+container, terminates TLS, issues certificates, and load-balances.
+
+WHY IT WON, mapped directly to the constraints:
+  * SCALES TO ZERO (minReplicas 0) — the single decisive feature. At idle the
+    replica count is 0 and compute cost is 0 (constraints A and B).
+  * A GENEROUS FREE MONTHLY GRANT covering the vCPU-seconds and GiB-seconds
+    this workload consumes, which is why the real bill is ~$0.
+  * ARBITRARY MEMORY within limits — 2 vCPU and 4GB RAM is configurable and
+    holds the model comfortably (constraint C).
+  * AZURE FILES VOLUME MOUNTS for persistence (constraint E).
+  * REVISIONS — immutable deployments with traffic splitting, so a rollback is
+    re-pointing traffic rather than rebuilding.
+  * MANAGED TLS CERTIFICATES, issued and renewed without intervention.
+
+WHAT IT COST US — the honest side of the ledger, all learned the hard way:
+  * COLD STARTS. Scaling to zero means the first request after idle waits for a
+    container to start AND for the model to load. Section 6.3 covers the
+    mitigations; the cost is real and cannot be fully removed without paying
+    for an always-warm replica.
+  * A ~240 SECOND INGRESS TIMEOUT, which is precisely why async ingest exists
+    (3.7). This is not configurable upward to an arbitrary value.
+  * TRAFFIC WEIGHT AND HEALTH ARE INDEPENDENT. A revision can hold 100% of
+    traffic while Unhealthy with zero replicas — the platform will not
+    automatically move traffic to a healthy older revision. This cost a
+    production outage to discover (9.9).
+  * VOLUME MOUNT FAILURES ARE INVISIBLE TO APPLICATION LOGS, because the
+    container never starts. They only appear in ContainerAppSystemLogs_CL.
+  * SMB SEMANTICS. Azure Files is SMB, and SQLite's locking expectations do not
+    survive that intact — hence the `nobrl` mount option.
+
+9.3 FRONTEND HOSTING — INCLUDING THE DETOUR WE TOOK AND REVERTED
+--------------------------------------------------------------------------------
+The frontend is a Next.js app exported to fully STATIC files. That decision came
+first and constrains the rest: with no server-side rendering there is no Node
+server to host, so hosting is a static file problem.
+
+  * GITHUB PAGES — ✅ CHOSEN. Free for public repositories with no quota
+    anxiety, integrated with the CI already running there, custom domains and
+    TLS supported, and a global CDN. Its one real constraint shaped the whole
+    workflow: PAGES PUBLISHES EXACTLY ONE ARTIFACT PER REPOSITORY, so two
+    environments cannot be deployed independently. See 9.7.
+
+  * VERCEL — REJECTED, despite being the most natural home for Next.js. The
+    Hobby tier is free but licensed for non-commercial use, and the whole point
+    of choosing static export was to not need Vercel's server-side features.
+    Adding a third vendor for something GitHub already does was not worth it.
+
+  * NETLIFY — REJECTED for effectively the same reasons.
+
+  * AZURE STATIC WEB APPS — REJECTED AFTER ACTUALLY IMPLEMENTING IT. This is
+    worth recording honestly because it was a genuine wrong turn: the whole
+    workflow was rewritten to deploy to Azure SWA on the reasoning that
+    consolidating on one cloud was tidier. It was then reverted to GitHub Pages
+    at the user's direction. The lesson retained: "everything in one vendor" is
+    an aesthetic preference, not a technical argument, and it does not
+    outweigh a working, free, already-integrated deployment.
+
+9.4 VECTOR DATABASE HOSTING RESEARCH
+--------------------------------------------------------------------------------
+  * QDRANT CLOUD — ✅ CHOSEN. A genuinely usable free tier (1GB cluster, no
+    time limit), first-class payload filtering — which is the mechanism
+    enforcing tenant isolation (5.1) — written in Rust with predictable memory
+    behaviour, and a clean migration path to self-hosting since it is open
+    source. Note the deployment reality: the free cluster is hosted on AWS
+    us-east, so vector search is a cross-cloud, cross-continent call from the
+    Central India backend. Accepted, because retrieval latency is dominated by
+    generation anyway.
+
+  * SELF-HOSTED QDRANT IN THE SAME CONTAINER — REJECTED. It would eliminate the
+    cross-cloud hop, but Qdrant needs persistent storage and memory of its own,
+    and co-locating it with the API in a scale-to-zero container means the
+    index is cold-started along with everything else.
+
+  * PINECONE — REJECTED. The managed experience is excellent, but the free tier
+    has historically been restrictive on index count and has moved terms
+    repeatedly; being fully proprietary means no self-hosting escape hatch.
+
+  * WEAVIATE — REJECTED. Very capable and open source, but heavier to operate,
+    and its free managed sandbox expires (14 days), which is disqualifying for
+    anything meant to stay up.
+
+  * pgvector (Postgres extension) — REJECTED FOR NOW, BUT THE MOST INTERESTING
+    ALTERNATIVE. With the planned Supabase migration (5.3) the project will
+    already have a Postgres instance, and pgvector would collapse two databases
+    into one, giving transactional consistency between metadata and vectors. It
+    was rejected today for two reasons: at the time of the decision there was
+    no Postgres in the stack at all, and pgvector's index types (IVFFlat/HNSW)
+    are less mature under heavy payload filtering than Qdrant's. Worth
+    re-evaluating after the Supabase migration lands.
+
+  * CHROMA / FAISS — REJECTED. FAISS is a library, not a server — no
+    persistence, filtering, or concurrent access story. Chroma is excellent for
+    local prototyping but its managed hosting was immature when this was
+    decided.
+
+9.5 DOCKER — IMAGE DESIGN DECISIONS
+--------------------------------------------------------------------------------
+The API image is a multi-stage build (docker/Dockerfile.api). Each decision in
+it exists for a measured reason.
+
+(1) MULTI-STAGE BUILD. A builder stage creates a virtualenv and installs
+    dependencies; the runtime stage copies only /opt/venv. Build tools and pip
+    caches never reach the final image.
+
+(2) CPU-ONLY TORCH, INSTALLED FIRST — THE SINGLE BIGGEST SIZE WIN.
+        RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
+    PyPI's default Linux torch wheel bundles the full CUDA stack
+    (nvidia-cublas, cudnn, triton and friends — multiple gigabytes) even though
+    bge-m3 only ever runs on CPU here. Installing the CPU wheel BEFORE the main
+    requirements satisfies sentence-transformers' `torch` dependency so pip
+    never reaches for the CUDA build. This is the same GPU-cost trap that ruled
+    out Phi-4, arriving through a transitive dependency instead of a model
+    choice.
+
+(3) A DEDICATED MODEL STAGE. Weights are downloaded in their own stage keyed
+    only to docker/fetch_models.py, then copied in. See 9.8 for why the obvious
+    alternative placement is wrong.
+
+(4) NON-ROOT USER. The container runs as `appuser`, created in the image, never
+    as root.
+
+(5) `COPY --chown` RATHER THAN A FOLLOWING `chown -R`. A separate ownership
+    pass rewrites every file into a new layer, which would put 2.3GB of weights
+    into the image twice.
+
+(6) EXPLICIT `COPY prompts/`. The prompts directory sits outside APP/ so the
+    security rules are reviewable on their own — which means it needs copying
+    explicitly. Its absence was a real bug: build_rag_payload would have raised
+    FileNotFoundError in production, silently disabling the prompt-injection
+    boundary.
+
+(7) A HEALTHCHECK instruction, so the platform can tell running from healthy.
+
+(8) A BUILD-TIME OFFLINE VERIFICATION STEP that loads the model with the
+    network forced off. A wrong cache path fails silently at runtime — the app
+    just downloads again, which is exactly the behaviour the baking removes —
+    so it is caught in the build instead. It has already caught one real bug
+    (challenge 14).
+
+(9) `.dockerignore` excludes .git, .venv, data/, tests/, docs and the whole
+    docker/ directory — with an explicit exception for fetch_models.py, which
+    must reach the build context or the COPY fails outright.
+
+RESULTING IMAGE: roughly 480MB before the model layer, roughly 2.9GB with it.
+That size is deliberate and is paid on image pull, which Container Apps caches
+per node — observed repeat pulls complete in about 20ms — versus a multi-gigabyte
+HuggingFace download on every single cold start.
+
+9.6 LOCAL DEVELOPMENT WITH DOCKER COMPOSE
+--------------------------------------------------------------------------------
+docker-compose.yml runs the full stack locally: the API, a local Qdrant with a
+named volume, and the frontend. It exists so that "works on my machine" and
+"works in production" are the same container image rather than two different
+environments.
+
+Two details worth recording:
+  * A `./data` bind mount reproduces the Azure Files volume, so per-document
+    BM25 paths and the SQLite database behave locally the way they do deployed.
+  * There is deliberately NO model-cache mount any more. It used to bind-mount
+    ./data/hf_cache over ~/.cache/huggingface to avoid re-downloading weights
+    on every container recreate. Once weights are baked into the image at
+    /opt/models, that mount would SHADOW the baked copy and reintroduce exactly
+    the download it was originally added to prevent. Removing it was part of
+    the same change.
+
+9.7 THE CI/CD PIPELINE
 --------------------------------------------------------------------------------
 BRANCHING: `develop` is the integration branch and deploys automatically to the
 dev environment. `main` is production and is promoted MANUALLY via
 workflow_dispatch — deliberately, so that production is only ever advanced by a
-conscious decision after dev has been exercised.
+conscious decision after dev has been exercised. The backend workflow's push
+trigger had `main` REMOVED from it specifically to enforce this.
 
 WORKFLOWS:
   * CI (on every push) — backend tests, frontend typecheck and build, and a
-    Docker image build. This is the authoritative check; local typechecking on
-    the development machine proved unreliable because the repository lives on a
-    cloud-synced folder where node_modules reads are pathologically slow.
+    Docker image build (without push). This is the authoritative check; local
+    typechecking on the development machine proved unreliable because the
+    repository lives on a cloud-synced folder where node_modules reads are
+    pathologically slow enough to wedge tsc entirely.
   * DEPLOY BACKEND — builds the image, pushes to GitHub Container Registry
-    tagged with the immutable commit sha (so a rollback is just re-pointing at
-    an older sha), then updates the Container App.
+    (GHCR) tagged with the IMMUTABLE COMMIT SHA, then updates the Container
+    App. Tagging by sha rather than `latest` is what makes rollback a
+    re-pointing operation instead of a rebuild.
   * DEPLOY FRONTEND — builds BOTH environments and publishes one Pages
     artifact.
+
+WHY GHCR RATHER THAN AZURE CONTAINER REGISTRY: GHCR is free for public
+repositories and requires no additional Azure resource or credential; the
+workflow already authenticates to GitHub. Azure Container Registry's Basic tier
+is billed monthly, which violates the $0 target for no functional gain at this
+scale.
 
 THE GITHUB PAGES DUAL-ENVIRONMENT CONSTRAINT. Pages publishes exactly ONE
 artifact per repository, so both environments must be produced in the same run —
@@ -1453,11 +1741,16 @@ into a single site directory with dev nested at /dev/. A consequence worth
 understanding: a push to develop DOES republish production — but it rebuilds
 production from `main`, so live content only changes when main changes.
 
-9.2 DOCKER IMAGE CACHING — A DESIGNED-FOR-CACHE-HIT BUILD
+A SMOKE TEST RUNS AFTER DEPLOY, polling both URLs until each returns 200. A
+green deploy step does not prove either URL actually serves — that lesson came
+from a "successful" deployment that was serving a completely stale route
+surface (9.9).
+
+9.8 BUILD CACHE DESIGN
 --------------------------------------------------------------------------------
-Baking 2.3GB of model weights into the image would be self-defeating if every CI
-build re-downloaded them. The Dockerfile is therefore structured so each layer
-is invalidated only by its own inputs:
+Baking 2.3GB of weights into the image would be self-defeating if every CI build
+re-downloaded them. The Dockerfile is structured so each layer is invalidated
+only by its own inputs:
 
   LAYER                  REBUILDS ONLY WHEN
   -----------------------------------------------------------
@@ -1469,30 +1762,59 @@ is invalidated only by its own inputs:
 
 The model download lives in its OWN BUILD STAGE depending only on the fetch
 script. The obvious placement — after pip install, where sentence-transformers
-is already available — would mean a cache miss cascades, and every dependency
+is already available — would mean a cache miss CASCADES, and every dependency
 bump would re-download 2.3GB. Keying the stage to the fetch script alone breaks
 that cascade.
 
-FOUR DETAILS THAT EACH WOULD HAVE SILENTLY BROKEN IT:
-  (a) .dockerignore excludes docker/ wholesale, so the fetch script needed an
-      explicit exception or the COPY would fail outright.
-  (b) The bge-m3 repository ships PyTorch AND ONNX weights plus README images
+THREE FURTHER DETAILS THAT WOULD EACH HAVE SILENTLY BROKEN IT:
+  (a) The bge-m3 repository ships PyTorch AND ONNX weights plus README images
       (~5GB together). Only the files the torch backend loads are fetched,
-      pinned by commit sha — which also closes the supply-chain gap of pulling
+      pinned by commit SHA — which also closes the supply-chain gap of pulling
       whatever a floating tag points at today.
-  (c) The weights are baked to /opt/models, NOT ~/.cache/huggingface, because
-      docker-compose bind-mounts over the latter for local development and
-      would have shadowed the baked copy.
-  (d) A build-time check loads the model with the network forced OFF. A wrong
-      path fails silently at runtime — the app simply downloads again, which is
-      the exact behaviour the baking removes — so it is caught in the build.
-      This check has already paid for itself once, catching the missing
-      refs/main problem in challenge 14.
+  (b) The weights are baked to /opt/models, NOT ~/.cache/huggingface, because
+      docker-compose bind-mounted over the latter (9.6).
+  (c) `--mount=type=cache` for pip is NOT exported to the registry cache — it
+      only helps local rebuilds. Layer caching is what carries CI.
 
 CI CACHE BACKEND: registry cache on GHCR rather than GitHub Actions cache. The
 Actions cache is capped near 10GB per repository with LRU eviction; a 2.3GB
 model layer on top of torch under mode=max would thrash it, evict the model
 layer, and re-download the weights anyway — defeating the entire exercise.
+
+9.9 DEPLOYMENT VERIFICATION, ROLLBACK, AND INCIDENTS
+--------------------------------------------------------------------------------
+VERIFICATION DISCIPLINE. "The workflow went green" is not deployment
+verification, and this project has the scar tissue to prove it. A workflow
+reporting success while the live endpoint served a completely stale route
+surface (6 routes instead of 18) is what established the standing rule: after
+every deploy, verify the RUNNING SYSTEM, not the pipeline's own opinion of
+itself. In practice that means curling the live endpoint, checking
+`az containerapp revision list` for BOTH health state and traffic weight, and
+for frontend changes, grepping the deployed bundle for the new code — Tailwind
+only emits a utility class it actually found in source, so its presence in the
+shipped CSS is real evidence rather than an assumption that an edit took effect.
+
+ROLLBACK. Images are tagged by immutable commit sha, so rolling back is
+re-pointing the Container App at an older sha — no rebuild, no branch surgery.
+
+INCIDENT 1 — A HEALTHY REVISION AT 0% TRAFFIC. Revision --0000007 held 100% of
+traffic while Unhealthy with zero replicas, while an older healthy revision sat
+at 0%. Live requests were routed to a revision that could not serve them.
+Diagnosed with `az containerapp revision list`; the lesson is that traffic
+weight and health are independent properties and both must be checked.
+
+INCIDENT 2 — CRASH-LOOP FROM A MISSING FILE SHARE. New revisions failed with
+VolumeMountFailure / "mount error(2): No such file or directory". The Container
+App referenced a share that had never been created, because the setup script
+swallowed stdout and stderr and printed "(share already exists)" on ANY non-zero
+exit. Found in ContainerAppSystemLogs_CL, not application logs — the container
+never started, so it had no application logs to produce.
+
+INCIDENT 3 — A TRUNCATED SECRET. The ACS connection string contains `;`;
+sourcing the env file without quoting truncated it at the first semicolon, so
+OTP email failed at runtime with an opaque error rather than at configuration
+time.
+
 
 
 ================================================================================
@@ -1587,6 +1909,296 @@ symptoms that pointed confidently at the wrong cause. In every case the fix
 came from following the evidence to the root rather than treating the symptom.
 That, more than any individual component, is what the codebase is intended to
 demonstrate.
+
+================================================================================
+11. REFERENCES AND SOURCES
+================================================================================
+
+Everything below was consulted while building this system. Papers are cited with
+their arXiv identifiers, which are stable; documentation is cited by canonical
+site, because vendor URLs move. Where a source shaped a specific decision in
+this project, that decision is named — a reading list is less useful than a
+record of what was actually taken from each source.
+
+11.1 FOUNDATIONAL PAPERS — RAG AND RETRIEVAL
+--------------------------------------------------------------------------------
+  * Lewis, P. et al. (2020). "Retrieval-Augmented Generation for
+    Knowledge-Intensive NLP Tasks." NeurIPS 2020. arXiv:2005.11401
+    → The paper that named RAG. Establishes the core architecture this entire
+      project implements: a retriever selecting passages, a generator
+      conditioned on them.
+
+  * Karpukhin, V. et al. (2020). "Dense Passage Retrieval for Open-Domain
+    Question Answering." EMNLP 2020. arXiv:2004.04906
+    → Established that dense embedding retrieval can beat BM25 on open-domain
+      QA. Also, read carefully, it is where the case for HYBRID retrieval comes
+      from: dense and sparse fail on different queries.
+
+  * Robertson, S. & Zaragoza, H. (2009). "The Probabilistic Relevance
+    Framework: BM25 and Beyond." Foundations and Trends in IR.
+    → The definitive treatment of BM25, the sparse half of our hybrid
+      retrieval (implemented via rank-bm25).
+
+  * Cormack, G., Clarke, C. & Buettcher, S. (2009). "Reciprocal Rank Fusion
+    Outperforms Condorcet and Individual Rank Learning Methods." SIGIR 2009.
+    → Directly implemented in APP/rag/vector_store.py. It is also the source of
+      the key insight that RRF is deliberately RANK-based, not score-based,
+      because a BM25 score and a cosine similarity are not comparable
+      quantities.
+
+  * Khattab, O. & Zaharia, M. (2020). "ColBERT: Efficient and Effective Passage
+    Search via Contextualized Late Interaction over BERT." SIGIR 2020.
+    arXiv:2004.12832
+    → Background reading on late-interaction retrieval; relevant because bge-m3
+      supports multi-vector output, which is a possible future upgrade path.
+
+11.2 PAPERS — EMBEDDINGS, RANKING, AND INDEXING
+--------------------------------------------------------------------------------
+  * Chen, J. et al. (2024). "BGE M3-Embedding: Multi-Lingual,
+    Multi-Functionality, Multi-Granularity Text Embeddings Through
+    Self-Knowledge Distillation." arXiv:2402.03216
+    → The model card and paper for the embedding model this project
+      self-hosts. Source of the 8192-token context figure and the
+      dense/sparse/multi-vector capability claims.
+
+  * Reimers, N. & Gurevych, I. (2019). "Sentence-BERT: Sentence Embeddings
+    using Siamese BERT-Networks." EMNLP 2019. arXiv:1908.10084
+    → The basis of the sentence-transformers library used to run bge-m3, and
+      the origin of the bi-encoder vs cross-encoder distinction that justifies
+      our retrieve-then-rerank design.
+
+  * Nogueira, R. & Cho, K. (2019). "Passage Re-ranking with BERT."
+    arXiv:1901.04085
+    → The case for cross-encoder reranking after first-stage retrieval, which
+      is exactly what FlashRank does in our pipeline.
+
+  * Malkov, Y. & Yashunin, D. (2018). "Efficient and Robust Approximate Nearest
+    Neighbor Search Using Hierarchical Navigable Small World Graphs." IEEE
+    TPAMI. arXiv:1603.09320
+    → The HNSW index Qdrant uses. Source of the understanding of `m`,
+      `ef_construct` and `ef_search`, and therefore of why filtered search
+      loses recall unless ef_search is raised — a fix in this codebase.
+
+11.3 PAPERS — EVALUATION AND LONG-CONTEXT BEHAVIOUR
+--------------------------------------------------------------------------------
+  * Es, S., James, J., Espinosa-Anke, L. & Schockaert, S. (2023). "RAGAS:
+    Automated Evaluation of Retrieval Augmented Generation." arXiv:2309.15217
+    → The evaluation framework implemented in eval/ragas_evaluation.py.
+      Defines faithfulness, answer relevancy, context precision and context
+      recall as used in section 8.
+
+  * Liu, N. F. et al. (2023). "Lost in the Middle: How Language Models Use Long
+    Contexts." TACL. arXiv:2307.03172
+    → The empirical basis for the claim in section 1.2 that a focused context
+      beats an exhaustive one, and therefore that RAG is not obsoleted by large
+      context windows. It shows retrieval accuracy degrades for information in
+      the middle of a long context.
+
+  * Muennighoff, N. et al. (2022). "MTEB: Massive Text Embedding Benchmark."
+    arXiv:2210.07316
+    → The benchmark behind the 63.0 vs 62.3 comparison used to justify choosing
+      bge-m3 over text-embedding-3-small.
+
+11.4 SECURITY REFERENCES
+--------------------------------------------------------------------------------
+  * OWASP Top 10 for Large Language Model Applications — owasp.org
+    → LLM01 (Prompt Injection) is the threat the entire APP/security/ module
+      exists to address. Also informed the treatment of insecure output
+      handling (our validate_output layer) and unbounded consumption (our rate
+      limiting).
+
+  * Simon Willison's writing on prompt injection — simonwillison.net
+    → The clearest practitioner explanation of why INDIRECT prompt injection is
+      the hard case, and of the crucial point that pattern matching is not a
+      security boundary. This directly shaped the decision documented in
+      guardrails.py: detection FLAGS AND LOGS while the structural
+      untrusted-data boundary does the actual containment.
+
+  * Microsoft, "Prompt Shields" / Azure AI Content Safety documentation —
+    learn.microsoft.com
+    → Researched as the potential LLM-firewall layer described in 7.8.
+
+  * Microsoft Presidio documentation — microsoft.github.io/presidio
+    → The intended implementation path for PII detection in 7.6. Open source,
+      runs locally, wraps spaCy NER, ships national-identifier recognisers.
+
+  * OWASP Authentication and Session Management guidance — owasp.org
+    → Informed the JWT handling, bcrypt password hashing, and the decision to
+      make OTP codes single-use, hashed at rest, and short-lived.
+
+  * IETF RFC 6749 (OAuth 2.0) and RFC 6750 (Bearer Token Usage)
+    → The Authorization Code flow implemented for GitHub and Google, and the
+      `state` parameter used for CSRF protection.
+
+  * PostgreSQL Row-Level Security documentation — postgresql.org/docs
+    → The basis for the RLS design in 7.7, including the critical detail that
+      table OWNERS bypass RLS by default, which silently defeats it if missed.
+
+11.5 OFFICIAL DOCUMENTATION
+--------------------------------------------------------------------------------
+AZURE (learn.microsoft.com)
+  * Azure Container Apps — scale rules, revisions, ingress, volume mounts,
+    secrets, and the `az containerapp` CLI. The revision/traffic-weight
+    behaviour in 9.9 was confirmed here after being observed in production.
+  * Azure OpenAI Service — model availability by region, deployment types
+    (Global Standard vs Provisioned Throughput), and retirement schedules. This
+    is where the gpt-4.1-mini retirement date and the gpt-4o-mini deprecation
+    were confirmed.
+  * Azure Files — SMB protocol behaviour and mount options, including `nobrl`.
+  * Azure Communication Services Email — including the documentation stating
+    that Azure Managed Domains are intended for testing and lack SPF/DKIM
+    alignment, which is the basis of the deliverability limitation in 6.4.
+  * Azure AI Document Intelligence — prebuilt-read and prebuilt-layout models
+    and their pricing meters.
+  * Azure Policy — how `sys.regionrestriction` constrains deployable regions.
+
+CORE FRAMEWORKS AND LIBRARIES
+  * FastAPI — fastapi.tiangolo.com. Dependency injection, middleware ordering,
+    exception handlers, background tasks.
+  * Starlette — the middleware model underneath FastAPI. Its documentation and
+    source are what explained ServerErrorMiddleware sitting outside all user
+    middleware, which is the root cause of the missing-CORS-on-500 bug.
+  * Pydantic — request/response validation and settings management.
+  * Next.js (App Router) — nextjs.org/docs. Static export, routing, and the
+    `basePath` configuration that makes the dual-environment deploy work.
+  * Tailwind CSS — tailwindcss.com/docs. Particularly the preflight stylesheet
+    and layer ordering, which explained the `[hidden]` vs `.grid` conflict.
+  * React — react.dev. Hooks, StrictMode double-invocation (which is why the
+    OAuth callback guards against a second code exchange).
+  * react-markdown — its README and the `urlTransform` API, which is where the
+    `cite:` scheme stripping was diagnosed.
+  * sentence-transformers — sbert.net. Model loading, `cache_folder`
+    resolution, batching behaviour, and the ONNX backend.
+  * Hugging Face Hub — huggingface.co/docs. `snapshot_download`, `allow_patterns`,
+    cache layout (`refs/`, `snapshots/`, `blobs/`), `local_dir`, and offline
+    mode. This documentation is what explained why a sha-pinned download has no
+    `refs/main` to resolve.
+  * Qdrant — qdrant.tech/documentation. Collections, payload indexes, filtering,
+    HNSW parameters, and the query API.
+  * Redis — redis.io/docs, and Upstash — upstash.com/docs for the serverless
+    tier and TLS connection strings.
+  * Supabase — supabase.com/docs. Free-tier limits, project pausing, and the
+    Supavisor connection pooler.
+  * SQLite — sqlite.org. Particularly the documentation on WAL mode and file
+    locking, which explains why WAL over SMB is unsafe.
+  * Docker — docs.docker.com. Multi-stage builds, BuildKit cache mounts, and
+    `.dockerignore` negation syntax.
+  * GitHub Actions — docs.github.com/actions. Workflow triggers, path filters,
+    `workflow_dispatch` inputs, and the cache size limits that drove the move
+    to registry caching.
+  * PyTorch — pytorch.org, specifically the CPU-only wheel index that avoids
+    pulling the CUDA stack.
+  * slowapi / limits — rate limiting semantics.
+  * FlashRank — its repository documentation for the reranker and its cache
+    directory behaviour.
+
+11.6 COMMUNITY WRITING, BLOGS, AND PRACTITIONER SOURCES
+--------------------------------------------------------------------------------
+  * Anthropic, "Introducing Contextual Retrieval" (2024) — anthropic.com
+    → An excellent treatment of chunk-level context loss, and supporting
+      evidence for combining semantic and lexical retrieval rather than
+      choosing one.
+
+  * Greg Kamradt, "5 Levels of Text Splitting" — the widely-referenced
+    practitioner taxonomy of chunking strategies (fixed, recursive, document-
+    structure, semantic, agentic).
+    → Directly relevant to section 3.2. Our conclusion diverged from the
+      popular enthusiasm for semantic chunking: we measured it, found it cost
+      5x the ingest time, and removed it. Worth recording that the community's
+      most fashionable option lost on measurement.
+
+  * Pinecone Learning Center — pinecone.io/learn
+    → Vendor-produced but genuinely good conceptual explanations of vector
+      search, ANN indexes and chunking trade-offs.
+
+  * Qdrant blog and documentation articles on hybrid search and filtering
+    → Background for the payload-filtering and RRF design.
+
+  * LangChain blog and documentation on text splitters and retrievers
+    → The RecursiveCharacterTextSplitter used as our fallback strategy, and the
+      SemanticChunker we ultimately removed.
+
+  * Stack Overflow / Server Fault threads on SQLite over SMB/CIFS network
+    shares
+    → Where the `nobrl` mount option and the general unsuitability of WAL over
+      SMB were established, after the crash-loop was diagnosed.
+
+  * GitHub issues and discussions — including the sentence-transformers and
+    huggingface_hub trackers for cache-path behaviour, and the fastembed
+    tracker confirming bge-m3 is not supported there (which is why ONNX export
+    is done via optimum rather than fastembed).
+
+  * MDN Web Docs — developer.mozilla.org
+    → CSS Grid (`minmax`, `auto` tracks, `align-content`, and critically the
+      `min-width: auto` default on grid items), which is what allowed the
+      layout overlap bug to be diagnosed as arithmetic rather than guessed at.
+
+11.7 BENCHMARKS, LEADERBOARDS, AND MODEL CARDS
+--------------------------------------------------------------------------------
+  * MTEB Leaderboard (Hugging Face) — embedding model comparison, used to
+    evaluate bge-m3 against alternatives.
+  * BAAI/bge-m3 model card (Hugging Face) — licence (MIT), file inventory, and
+    the pinned commit sha used in docker/fetch_models.py.
+  * Azure OpenAI model and pricing pages — the per-token costs quoted in 3.5.
+  * Azure Container Apps and Azure Files pricing pages — the basis of the
+    ~$50/month always-warm figure and the $0 scale-to-zero conclusion.
+  * Mistral and Azure Document Intelligence pricing pages — the per-page OCR
+    costs modelled in 3.6.
+
+11.8 INVESTIGATIVE COMMANDS — HOW FACTS WERE ESTABLISHED
+--------------------------------------------------------------------------------
+Several conclusions in this document came not from reading but from
+interrogating the live system. Recording them because they are reproducible,
+and because "the documentation says X" was repeatedly wrong:
+
+  az cognitiveservices model list -l uaenorth
+      Revealed that UAE North carries a completely different and current model
+      catalog from Central India — the finding that ended the four-attempt
+      model search.
+
+  az containerapp revision list -n <app> -g <rg> -o table
+      Shows Active, Replicas, TrafficWeight and HealthState together. This is
+      what exposed a revision holding 100% of traffic while unhealthy with zero
+      replicas.
+
+  Log Analytics: ContainerAppSystemLogs_CL
+      Platform-level events. The VolumeMountFailure was only visible here,
+      because the container never started and so produced no application logs.
+
+  curl <fqdn>/openapi.json
+      Enumerates the routes the LIVE service actually serves — which is how a
+      "successful" deploy was proven to be serving a stale 6-route surface.
+
+  docker run --platform linux/amd64 <image> …
+      Inspecting the contents of the actually-pushed image, rather than
+      trusting that the build did what the Dockerfile says.
+
+  git reflog show / git diff --stat <commit> -- <paths>
+      Reconstructed the git history incident and proved no content was lost.
+
+  Reproducing CORS middleware ordering against real Starlette in a scratch
+  script, rather than reasoning about it — which is how CORS-last was
+  confirmed as the fix.
+
+11.9 A NOTE ON HOW SOURCES WERE USED
+--------------------------------------------------------------------------------
+Two habits are worth stating explicitly, because they affected the outcome more
+than any individual source did.
+
+FIRST: vendor documentation was treated as a starting point, not as ground
+truth. Azure's model catalog listed models that could not actually be deployed.
+A workflow reported success while serving stale code. A setup script reported
+that a file share existed when it did not. In each case the documentation or
+the tool was not lying so much as answering a slightly different question than
+the one being asked. Every significant claim in this project was verified
+against the running system.
+
+SECOND: popularity was not treated as evidence. Semantic chunking is the most
+fashionable chunking strategy in the RAG community and it lost, on measurement,
+by a factor of five in time for no demonstrated quality gain. Parallelising the
+embedding path is an obvious optimisation and it made things slower. Both were
+removed. The benchmark, not the blog post, decided.
+
 
 ================================================================================
 APPENDIX A — THE COMPLETE DEVELOPMENT PLAN, PHASE BY PHASE
