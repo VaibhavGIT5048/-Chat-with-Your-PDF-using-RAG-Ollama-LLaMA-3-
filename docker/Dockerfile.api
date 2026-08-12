@@ -80,25 +80,25 @@ COPY --from=models --chown=appuser:appuser /opt/models /opt/models
 # likewise overrides a default of data/flashrank_cache, which lands on the Azure
 # Files share in production and is slow to read.
 #
-# HF_HUB_CACHE (not HF_HOME) is the one that must match: fetch_models.py passes
-# cache_dir=/opt/models/hf, and HF_HOME would imply a cache at $HF_HOME/hub —
-# one directory deeper than where the files actually are, so nothing would be
-# found. sentence-transformers reads SENTENCE_TRANSFORMERS_HOME as its
-# cache_folder, which it forwards as that same cache_dir.
-ENV HF_HUB_CACHE=/opt/models/hf \
-    SENTENCE_TRANSFORMERS_HOME=/opt/models/hf \
+# BGE_MODEL_NAME is a filesystem path, not a repo id: fetch_models.py wrote the
+# weights to a plain directory precisely so loading never goes through the hub
+# cache, whose repo-id lookup needs a refs/main that a sha-pinned download does
+# not create. APP/providers/embedding.py reads this var.
+ENV BGE_MODEL_NAME=/opt/models/bge-m3 \
     FLASHRANK_CACHE_DIR=/opt/models/flashrank
 
 USER appuser
 WORKDIR /home/appuser/app
 
-# Prove the bake actually resolves, with the network forced off. A wrong cache
-# path fails silently at runtime — the app just downloads again, which is the
-# exact behaviour this is meant to remove — so it is worth catching in the
-# build. Sits above the code COPYs so it stays cached across ordinary commits.
+# Prove the bake actually resolves, with the network forced off. A wrong path
+# fails silently at runtime — the app just downloads again, which is the exact
+# behaviour this is meant to remove — so it is worth catching in the build. This
+# check already paid for itself once, catching the refs/main problem above.
+# Sits above the code COPYs so it stays cached across ordinary commits.
 RUN HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -c "\
+import os; \
 from sentence_transformers import SentenceTransformer; \
-m = SentenceTransformer('BAAI/bge-m3', device='cpu'); \
+m = SentenceTransformer(os.environ['BGE_MODEL_NAME'], device='cpu'); \
 v = m.encode(['offline bake check'], normalize_embeddings=True); \
 print('bge-m3 loaded offline from image, dim =', len(v[0]))"
 

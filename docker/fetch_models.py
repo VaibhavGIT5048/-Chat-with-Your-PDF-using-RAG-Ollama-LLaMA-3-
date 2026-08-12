@@ -56,15 +56,22 @@ BGE_M3_ALLOW = [
 
 
 def main() -> int:
-    hf_home = os.path.join(TARGET, "hf")
-    os.makedirs(hf_home, exist_ok=True)
+    # local_dir, not cache_dir. The hub cache is keyed by revision and resolves
+    # a repo id through refs/main -> sha; downloading a pinned sha never writes
+    # that ref, so an offline load of "BAAI/bge-m3" has nothing to resolve and
+    # fails even though the weights are right there. A plain directory sidesteps
+    # the whole mechanism: sentence-transformers loads a filesystem path
+    # directly, with no hub lookup, no refs, and no offline flags to get right.
+    # BGE_MODEL_NAME is set to this path in the image.
+    bge_dir = os.path.join(TARGET, "bge-m3")
+    os.makedirs(bge_dir, exist_ok=True)
 
-    print(f"↓ BAAI/bge-m3 @ {BGE_M3_REVISION[:12]} -> {hf_home}", flush=True)
+    print(f"↓ BAAI/bge-m3 @ {BGE_M3_REVISION[:12]} -> {bge_dir}", flush=True)
     snapshot_download(
         repo_id="BAAI/bge-m3",
         revision=BGE_M3_REVISION,
         allow_patterns=BGE_M3_ALLOW,
-        cache_dir=hf_home,
+        local_dir=bge_dir,
     )
 
     # FlashRank fetches its ranker on first construction. Doing it here means
