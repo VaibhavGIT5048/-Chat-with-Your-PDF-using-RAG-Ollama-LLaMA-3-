@@ -30,7 +30,12 @@ set -euo pipefail
 RG=rag-api-rg
 APP=rag-api
 ENVIRONMENT=rag-api-env
-SHARE=rag-data                  # production's existing share
+# TWO DIFFERENT NAMES, and conflating them is an easy mistake: STORAGE_DEF is
+# the storage registration on the managed environment (what a volume's
+# `storageName` refers to), while the Azure Files share it points at is called
+# something else entirely. On production these are `rag-data-storage` and
+# `rag-data` respectively.
+STORAGE_DEF=rag-data-storage
 MOUNT=/home/appuser/app/data
 COLLECTION=chunks_collection_v2
 
@@ -60,16 +65,16 @@ echo "==> 1/4  Verify the production file share exists"
 # that reported success when the share was in fact absent. Failing loudly on a
 # missing share is the whole point.
 STORAGE_ACCOUNT=$(az containerapp env storage show -n "$ENVIRONMENT" -g "$RG" \
-  --storage-name "$SHARE" --query 'properties.azureFile.accountName' -o tsv 2>/dev/null || true)
+  --storage-name "$STORAGE_DEF" --query 'properties.azureFile.accountName' -o tsv 2>/dev/null || true)
 
 if [ -z "${STORAGE_ACCOUNT:-}" ] || [ "$STORAGE_ACCOUNT" = "null" ]; then
-  echo "ERROR: environment storage '$SHARE' is not registered on $ENVIRONMENT."
+  echo "ERROR: environment storage '$STORAGE_DEF' is not registered on $ENVIRONMENT."
   echo "       Inspect with: az containerapp env storage list -n $ENVIRONMENT -g $RG -o table"
   exit 1
 fi
 
 SHARE_NAME=$(az containerapp env storage show -n "$ENVIRONMENT" -g "$RG" \
-  --storage-name "$SHARE" --query 'properties.azureFile.shareName' -o tsv)
+  --storage-name "$STORAGE_DEF" --query 'properties.azureFile.shareName' -o tsv)
 
 if ! az storage share-rm show --storage-account "$STORAGE_ACCOUNT" -g "$RG" \
      --name "$SHARE_NAME" --query name -o tsv >/dev/null 2>&1; then
@@ -121,7 +126,7 @@ TMP=$(mktemp -d)
 # fails while the `az update` after it still "succeeds" against an unpatched
 # file — the mount silently never lands. JSON is valid YAML to az.
 az containerapp show -n "$APP" -g "$RG" -o json > "$TMP/app.json"
-python3 - "$TMP/app.json" "$SHARE" "$MOUNT" <<'PY'
+python3 - "$TMP/app.json" "$STORAGE_DEF" "$MOUNT" <<'PY'
 import sys, json
 path, share, mount = sys.argv[1], sys.argv[2], sys.argv[3]
 doc = json.load(open(path))
