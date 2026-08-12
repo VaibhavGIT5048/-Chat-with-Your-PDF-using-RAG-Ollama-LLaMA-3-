@@ -47,6 +47,11 @@ interface Turn {
   /** Collapsed by default — several expanded source cards per turn drowns
    *  out the answer itself. Clicking a citation forces this open. */
   sourcesOpen?: boolean
+  /** Only meaningful for a turn rendered as a history-rail row (i.e. not the
+   *  newest one, which always renders in full in the main column). Collapsed
+   *  by default so the rail is a scannable list of questions, not a second
+   *  copy of the whole conversation. */
+  historyOpen?: boolean
 }
 
 interface CitationFocus {
@@ -188,13 +193,17 @@ export function WorkbenchView() {
 
   // Focusing a citation highlights one source card, so the dropdown holding
   // that card has to open too — otherwise the highlight lands inside a
-  // collapsed panel and the click appears to do nothing.
+  // collapsed panel and the click appears to do nothing. historyOpen is the
+  // same idea one level up: a citation on an older turn is only reachable at
+  // all once that turn's rail row is expanded, so this opens both regardless
+  // of which one the click actually happened in — harmless on the newest
+  // turn, which has no rail row to open.
   const focusCitation = useCallback(
     (turnId: string, source: string, page: string) => {
       const alreadyFocused =
         focus?.turnId === turnId && focus.source === source && focus.page === page
       setFocus(alreadyFocused ? null : { turnId, source, page })
-      if (!alreadyFocused) patchTurn(turnId, { sourcesOpen: true })
+      if (!alreadyFocused) patchTurn(turnId, { sourcesOpen: true, historyOpen: true })
     },
     [focus, patchTurn],
   )
@@ -267,6 +276,12 @@ export function WorkbenchView() {
   const connected = isConnected
   const hasExistingIndex = Boolean(documentId)
   const emptyTranscript = transcript.length === 0
+  // Only the newest turn gets the full main-column treatment; everything
+  // before it is history and lives in the side rail instead. transcript is
+  // chronological (oldest first) whether it came from getChatHistory or from
+  // appending a fresh question, so the last element is always "newest".
+  const latestTurn = transcript.at(-1) ?? null
+  const olderTurns = transcript.length > 1 ? transcript.slice(0, -1) : []
 
   const renderAnswer = (turn: Turn) => {
     const full = turn.answer ?? ''
@@ -348,6 +363,145 @@ export function WorkbenchView() {
     )
   }
 
+  // Full content for one turn — question, answer, sources, request id. Used
+  // both for the newest turn (always shown, in the main column) and for a
+  // history-rail row once it's expanded; identical either way, so citation
+  // focus and the sources dropdown behave the same regardless of where a turn
+  // happens to be rendered.
+  const renderTurnBody = (turn: Turn) => {
+    const sourceMax = maxScore(turn.sources)
+    const focusedIndices =
+      focus?.turnId === turn.id ? matchSourceIndices(turn.sources, focus.source, focus.page) : []
+
+    return (
+      <div className="grid gap-4 p-5">
+        <div className="flex flex-wrap items-baseline gap-3">
+          <div className="text-[12px] font-extrabold uppercase tracking-[0.1em] opacity-55">Question</div>
+          <div className="text-[16px] font-extrabold tracking-[-0.01em]">{turn.question}</div>
+        </div>
+
+        {turn.pending && (
+          <div className="flex items-center gap-3 text-[13px] opacity-70">
+            <Spinner size={16} />
+            <span>{QUERY_STAGES[thinkingIdx]}</span>
+          </div>
+        )}
+
+        {turn.error && (
+          <div role="alert" className="grid gap-2 p-[14px] text-[13px] leading-[1.55]" style={{ border: 'var(--brd-w) solid var(--accent)' }}>
+            <div className="font-extrabold">{turn.errorTitle ?? 'Request failed'}</div>
+            <div className="opacity-75">{turn.error}</div>
+            <Mono className="text-[11.5px] opacity-50">X-Request-ID {turn.requestId ?? 'none returned'}</Mono>
+          </div>
+        )}
+
+        {turn.answer && !turn.error && (
+          <div className="grid gap-4">
+            {renderAnswer(turn)}
+
+            <div>
+              {turn.sources.length === 0 ? (
+                <>
+                  <div className="mb-3 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
+                    Sources
+                  </div>
+                  <div className="text-[13px] opacity-60">The backend returned no sources for this answer.</div>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => patchTurn(turn.id, { sourcesOpen: !turn.sourcesOpen })}
+                    aria-expanded={Boolean(turn.sourcesOpen)}
+                    aria-controls={`sources-${turn.id}`}
+                    className="mb-3 flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55 hover:opacity-90"
+                  >
+                    <ChevronRight
+                      size={13}
+                      aria-hidden
+                      style={{
+                        transform: turn.sourcesOpen ? 'rotate(90deg)' : 'none',
+                        transition: 'transform .18s ease',
+                      }}
+                    />
+                    Sources ({turn.sources.length})
+                  </button>
+
+                  {/* Toggled by class, not the `hidden` attribute: Tailwind's
+                      `.grid` utility sits in a later layer than preflight's
+                      `[hidden]` rule at equal specificity, so it would win and
+                      the collapsed panel would stay on screen. */}
+                  <div
+                    id={`sources-${turn.id}`}
+                    className={turn.sourcesOpen ? 'grid gap-3' : 'hidden'}
+                  >
+                    {turn.sources.map((source, index) => {
+                      const focused = focusedIndices.includes(index)
+                      return (
+                        <button
+                          key={`${turn.id}-${index}`}
+                          type="button"
+                          onClick={() =>
+                            setFocus((current) =>
+                              current?.turnId === turn.id && current.source === source.source && current.page === String(source.page ?? '—')
+                                ? null
+                                : { turnId: turn.id, source: source.source, page: String(source.page ?? '—') },
+                            )
+                          }
+                          className="grid gap-3 text-left transition-transform"
+                          style={{
+                            padding: '16px',
+                            background: focused ? 'color-mix(in srgb, var(--accent) 10%, var(--panel-solid))' : 'var(--panel-solid)',
+                            border: `var(--brd-w) solid ${focused ? 'var(--accent)' : 'var(--brd)'}`,
+                            transform: focused ? 'translateY(-1px)' : 'none',
+                          }}
+                        >
+                          <div className="flex flex-wrap items-baseline justify-between gap-3">
+                            <div className="text-[14px] font-extrabold">{source.source}</div>
+                            <div className="flex flex-wrap gap-3 text-[11px] font-extrabold uppercase tracking-[0.08em] opacity-55">
+                              <span>{source.page ?? 'page —'}</span>
+                              <span>chunk {source.chunk_id ?? '—'}</span>
+                              <span>score {formatScore(source.score)}</span>
+                            </div>
+                          </div>
+
+                          <div className="h-[6px] overflow-hidden" style={{ background: 'var(--brd)' }}>
+                            <span
+                              style={{
+                                width: scoreBarPercent(source.score, sourceMax),
+                                background: 'var(--accent)',
+                                transition: 'width .9s cubic-bezier(.2,.8,.2,1)',
+                              }}
+                              className="block h-full"
+                            />
+                          </div>
+
+                          <div className="text-[13px] leading-[1.6] opacity-78">
+                            {source.content || 'No excerpt returned.'}
+                          </div>
+                        </button>
+                      )
+                    })}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {!turn.pending && !turn.error && !turn.answer && (
+          <div className="text-[13px] opacity-60">No answer returned.</div>
+        )}
+
+        {turn.requestId && (
+          <div className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-45">
+            request {turn.requestId.slice(0, 8)}
+          </div>
+        )}
+      </div>
+    )
+  }
+
   const onIngested = (stats: IngestResponse) => {
     router.replace(`/workbench?doc=${encodeURIComponent(stats.document_id)}`)
     setRefreshToken((token) => token + 1)
@@ -415,7 +569,7 @@ export function WorkbenchView() {
         )}
       </section>
 
-      <div className="grid gap-7 lg:grid-cols-[minmax(320px,0.9fr)_minmax(420px,1.5fr)]">
+      <div className="grid gap-7 lg:grid-cols-[minmax(260px,0.65fr)_minmax(440px,1.35fr)_minmax(260px,0.8fr)]">
         <div className="grid gap-7">
           <IngestPanel
             connected={connected}
@@ -423,21 +577,24 @@ export function WorkbenchView() {
             onIngested={onIngested}
           />
 
+          {/* One slim row instead of a header + three stacked rows — the same
+              three facts, without a card's worth of padding around each. */}
           <Panel>
-            <PanelHeader title="Quick status" right={<span className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-50">live</span>} />
-            <div className="grid gap-3 p-5 text-[13px] leading-[1.55]">
-              <div className="flex justify-between gap-4">
-                <span className="opacity-65">Backend</span>
-                <span className="font-extrabold">{connected ? 'Connected' : 'Offline'}</span>
-              </div>
-              <div className="flex justify-between gap-4">
-                <span className="opacity-65">Collection</span>
-                <span className="font-extrabold">{documentId ?? 'No document selected'}</span>
-              </div>
-              <div className="flex justify-between gap-4">
-                <span className="opacity-65">Transit mode</span>
-                <span className="font-extrabold">{querying ? QUERY_STAGES[thinkingIdx] : 'Ready'}</span>
-              </div>
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 text-[12.5px]">
+              <span className="flex items-center gap-[6px] font-extrabold">
+                <span
+                  className="h-2 w-2 rounded-full"
+                  aria-hidden
+                  style={{ background: connected ? 'var(--accent)' : 'var(--brd)' }}
+                />
+                {connected ? 'Connected' : 'Offline'}
+              </span>
+              <span className="opacity-35">·</span>
+              <span className="min-w-0 truncate" title={documentId ?? undefined}>
+                <Mono className="opacity-70">{documentId ?? 'No document selected'}</Mono>
+              </span>
+              <span className="opacity-35">·</span>
+              <span className="opacity-70">{querying ? QUERY_STAGES[thinkingIdx] : 'Ready'}</span>
             </div>
           </Panel>
         </div>
@@ -562,144 +719,10 @@ export function WorkbenchView() {
               </div>
             </Panel>
           ) : (
-            transcript
-              .slice()
-              .reverse()
-              .map((turn) => {
-                const sourceMax = maxScore(turn.sources)
-                const focusedIndices =
-                  focus?.turnId === turn.id ? matchSourceIndices(turn.sources, focus.source, focus.page) : []
-
-                return (
-                  <Panel key={turn.id}>
-                    <div className="grid gap-4 p-5">
-                      <div className="flex flex-wrap items-baseline gap-3">
-                        <div className="text-[12px] font-extrabold uppercase tracking-[0.1em] opacity-55">Question</div>
-                        <div className="text-[16px] font-extrabold tracking-[-0.01em]">{turn.question}</div>
-                      </div>
-
-                      {turn.pending && (
-                        <div className="flex items-center gap-3 text-[13px] opacity-70">
-                          <Spinner size={16} />
-                          <span>{QUERY_STAGES[thinkingIdx]}</span>
-                        </div>
-                      )}
-
-                      {turn.error && (
-                        <div role="alert" className="grid gap-2 p-[14px] text-[13px] leading-[1.55]" style={{ border: 'var(--brd-w) solid var(--accent)' }}>
-                          <div className="font-extrabold">{turn.errorTitle ?? 'Request failed'}</div>
-                          <div className="opacity-75">{turn.error}</div>
-                          <Mono className="text-[11.5px] opacity-50">X-Request-ID {turn.requestId ?? 'none returned'}</Mono>
-                        </div>
-                      )}
-
-                      {turn.answer && !turn.error && (
-                        <div className="grid gap-4">
-                          {renderAnswer(turn)}
-
-                          <div>
-                            {turn.sources.length === 0 ? (
-                              <>
-                                <div className="mb-3 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
-                                  Sources
-                                </div>
-                                <div className="text-[13px] opacity-60">The backend returned no sources for this answer.</div>
-                              </>
-                            ) : (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => patchTurn(turn.id, { sourcesOpen: !turn.sourcesOpen })}
-                                  aria-expanded={Boolean(turn.sourcesOpen)}
-                                  aria-controls={`sources-${turn.id}`}
-                                  className="mb-3 flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55 hover:opacity-90"
-                                >
-                                  <ChevronRight
-                                    size={13}
-                                    aria-hidden
-                                    style={{
-                                      transform: turn.sourcesOpen ? 'rotate(90deg)' : 'none',
-                                      transition: 'transform .18s ease',
-                                    }}
-                                  />
-                                  Sources ({turn.sources.length})
-                                </button>
-
-                                {/* Toggled by class, not the `hidden` attribute: Tailwind's
-                                    `.grid` utility sits in a later layer than preflight's
-                                    `[hidden]` rule at equal specificity, so it would win and
-                                    the collapsed panel would stay on screen. */}
-                                <div
-                                  id={`sources-${turn.id}`}
-                                  className={turn.sourcesOpen ? 'grid gap-3' : 'hidden'}
-                                >
-                                  {turn.sources.map((source, index) => {
-                                    const focused = focusedIndices.includes(index)
-                                    return (
-                                      <button
-                                        key={`${turn.id}-${index}`}
-                                        type="button"
-                                        onClick={() =>
-                                          setFocus((current) =>
-                                            current?.turnId === turn.id && current.source === source.source && current.page === String(source.page ?? '—')
-                                              ? null
-                                              : { turnId: turn.id, source: source.source, page: String(source.page ?? '—') },
-                                          )
-                                        }
-                                        className="grid gap-3 text-left transition-transform"
-                                        style={{
-                                          padding: '16px',
-                                          background: focused ? 'color-mix(in srgb, var(--accent) 10%, var(--panel-solid))' : 'var(--panel-solid)',
-                                          border: `var(--brd-w) solid ${focused ? 'var(--accent)' : 'var(--brd)'}`,
-                                          transform: focused ? 'translateY(-1px)' : 'none',
-                                        }}
-                                      >
-                                        <div className="flex flex-wrap items-baseline justify-between gap-3">
-                                          <div className="text-[14px] font-extrabold">{source.source}</div>
-                                          <div className="flex flex-wrap gap-3 text-[11px] font-extrabold uppercase tracking-[0.08em] opacity-55">
-                                            <span>{source.page ?? 'page —'}</span>
-                                            <span>chunk {source.chunk_id ?? '—'}</span>
-                                            <span>score {formatScore(source.score)}</span>
-                                          </div>
-                                        </div>
-
-                                        <div className="h-[6px] overflow-hidden" style={{ background: 'var(--brd)' }}>
-                                          <span
-                                            className="block h-full"
-                                            style={{
-                                              width: scoreBarPercent(source.score, sourceMax),
-                                              background: 'var(--accent)',
-                                              transition: 'width .9s cubic-bezier(.2,.8,.2,1)',
-                                            }}
-                                          />
-                                        </div>
-
-                                        <div className="text-[13px] leading-[1.6] opacity-78">
-                                          {source.content || 'No excerpt returned.'}
-                                        </div>
-                                      </button>
-                                    )
-                                  })}
-                                </div>
-                              </>
-                            )}
-                          </div>
-                        </div>
-                      )}
-
-                      {!turn.pending && !turn.error && !turn.answer && (
-                        <div className="text-[13px] opacity-60">No answer returned.</div>
-                      )}
-
-                      {turn.requestId && (
-                        <div className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-45">
-                          request {turn.requestId.slice(0, 8)}
-                        </div>
-                      )}
-                    </div>
-                  </Panel>
-                )
-              })
+            // Only the newest turn renders here — everything before it is in
+            // the history rail (third column) instead of stacking on top of
+            // the answer someone just asked for.
+            latestTurn && <Panel key={latestTurn.id}>{renderTurnBody(latestTurn)}</Panel>
           )}
 
           <Panel>
@@ -715,7 +738,56 @@ export function WorkbenchView() {
           </Panel>
         </div>
 
-        <div className="lg:col-span-2">
+        {olderTurns.length > 0 && (
+          <div className="grid content-start gap-4">
+            <Panel>
+              <PanelHeader
+                title="History"
+                right={
+                  <span className="text-[11px] font-extrabold uppercase tracking-[0.1em] opacity-50">
+                    {olderTurns.length} earlier
+                  </span>
+                }
+              />
+              <div className="grid" style={{ gap: 'var(--brd-w)', background: 'var(--brd)' }}>
+                {olderTurns
+                  .slice()
+                  .reverse()
+                  .map((turn) => (
+                    <div key={turn.id} style={{ background: 'var(--panel-solid)' }}>
+                      <button
+                        type="button"
+                        onClick={() => patchTurn(turn.id, { historyOpen: !turn.historyOpen })}
+                        aria-expanded={Boolean(turn.historyOpen)}
+                        className="flex w-full items-start gap-2 px-4 py-3 text-left transition-colors hover:opacity-90"
+                      >
+                        <ChevronRight
+                          size={13}
+                          aria-hidden
+                          className="mt-[3px] shrink-0"
+                          style={{
+                            transform: turn.historyOpen ? 'rotate(90deg)' : 'none',
+                            transition: 'transform .18s ease',
+                          }}
+                        />
+                        <span className="min-w-0 flex-1 text-[13px] font-extrabold leading-[1.4]" style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}>
+                          {turn.question}
+                        </span>
+                      </button>
+                      {/* Real conditional, not a CSS hide: a collapsed row's
+                          answer is never asked for again, so there is no
+                          reason to Markdown-parse it on every render — and
+                          the newest turn's typing animation re-renders this
+                          whole view roughly 40 times a second. */}
+                      {turn.historyOpen && renderTurnBody(turn)}
+                    </div>
+                  ))}
+              </div>
+            </Panel>
+          </div>
+        )}
+
+        <div className="lg:col-span-3">
           <CollectionsPanel refreshToken={refreshToken} />
         </div>
       </div>

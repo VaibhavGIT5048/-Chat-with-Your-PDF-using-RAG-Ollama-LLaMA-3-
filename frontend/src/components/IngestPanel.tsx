@@ -154,6 +154,22 @@ export function IngestPanel({ connected, hasExistingIndex, onIngested }: Props) 
   const elapsedLabel = `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
   const showWarning = hasExistingIndex && files.length > 0
 
+  // Once a document already exists, the full two-line pitch ("Drop
+  // documents, or click to choose" + accepted-formats copy) is only ever
+  // read once — after that it's dead space every time this panel is in view.
+  const dropTitle = files.length
+    ? `${files.length} document${files.length === 1 ? '' : 's'} selected`
+    : dragging
+      ? 'Drop them'
+      : hasExistingIndex
+        ? '+ Add another document'
+        : 'Drop documents, or click to choose'
+  const dropSubtitle = files.length
+    ? files.map((f) => f.name).join(' · ')
+    : hasExistingIndex
+      ? 'Drop a file here, or click to choose'
+      : '.pdf, .txt, .md, Office files and images accepted'
+
   return (
     <Panel>
       <PanelHeader
@@ -184,20 +200,14 @@ export function IngestPanel({ connected, hasExistingIndex, onIngested }: Props) 
             setDragging(false)
             takeFiles(e.dataTransfer.files)
           }}
-          className="cursor-pointer px-5 py-[34px] text-left transition-colors"
+          className="cursor-pointer px-5 py-4 text-left transition-colors"
           style={{
             border: `var(--brd-w) dashed ${dragging ? 'var(--accent)' : 'var(--brd)'}`,
             background: dragging ? 'color-mix(in srgb, var(--accent) 10%, transparent)' : 'transparent',
           }}
         >
-          <div className="mb-[6px] text-[16px] font-extrabold tracking-[-0.01em]">
-            {files.length ? `${files.length} document${files.length === 1 ? '' : 's'} selected` : dragging ? 'Drop them' : 'Drop documents, or click to choose'}
-          </div>
-          <div className="text-[12.5px] opacity-60">
-            {files.length
-              ? files.map((f) => f.name).join(' · ')
-              : '.pdf, .txt, .md, Office files and images accepted'}
-          </div>
+          <div className="mb-[3px] text-[15px] font-extrabold tracking-[-0.01em]">{dropTitle}</div>
+          <div className="text-[12px] opacity-60">{dropSubtitle}</div>
         </div>
 
         {showWarning && (
