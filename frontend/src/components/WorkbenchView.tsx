@@ -313,8 +313,12 @@ export function WorkbenchView() {
             scheme first, so one parse covers the whole answer — splitting the
             string around citations breaks any list item or bold run they sit
             inside. The `a` override swaps those links back for chips. */}
+        {/* Capped at a readable measure. Now that the answer panel spans the
+            full page width, uncapped prose would run to ~200 characters a
+            line, which is where reading accuracy falls apart — the spare
+            width goes to the sources column instead. */}
         <div
-          className="answer-prose text-[15px] leading-[1.7]"
+          className="answer-prose max-w-[76ch] text-[15px] leading-[1.7]"
           data-typing={stillTyping ? 'true' : 'false'}
         >
           <ReactMarkdown
@@ -372,10 +376,16 @@ export function WorkbenchView() {
   // history-rail row once it's expanded; identical either way, so citation
   // focus and the sources dropdown behave the same regardless of where a turn
   // happens to be rendered.
-  const renderTurnBody = (turn: Turn) => {
+  const renderTurnBody = (turn: Turn, wide = false) => {
     const sourceMax = maxScore(turn.sources)
     const focusedIndices =
       focus?.turnId === turn.id ? matchSourceIndices(turn.sources, focus.source, focus.page) : []
+    // Sources sit beside the answer in the wide layout rather than under it,
+    // so starting them open costs no vertical space and fills a column that
+    // would otherwise be blank. In the narrow rail they stay collapsed, where
+    // stacking several expanded cards is exactly the noise worth avoiding.
+    // `?? wide` keeps an explicit toggle winning over the per-layout default.
+    const sourcesOpen = turn.sourcesOpen ?? wide
 
     return (
       <div className="grid gap-4 p-5">
@@ -400,10 +410,24 @@ export function WorkbenchView() {
         )}
 
         {turn.answer && !turn.error && (
-          <div className="grid gap-4">
-            {renderAnswer(turn)}
+          // Wide: prose and sources side by side. The prose column is capped
+          // at a readable measure (see renderAnswer), so the leftover width
+          // goes to the sources rather than stretching lines to 200 characters.
+          <div
+            className={
+              wide
+                // `auto` rather than a fixed fr: the prose is capped at 76ch,
+                // so a fixed ratio would leave dead space between the two
+                // columns whenever the cap bit. Sizing the prose track to its
+                // content and giving the remainder to the sources means the
+                // full width is always used, whatever the answer's length.
+                ? 'grid items-start gap-6 xl:grid-cols-[auto_minmax(0,1fr)]'
+                : 'grid gap-4'
+            }
+          >
+            <div className="min-w-0">{renderAnswer(turn)}</div>
 
-            <div>
+            <div className="min-w-0">
               {turn.sources.length === 0 ? (
                 <>
                   <div className="mb-3 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55">
@@ -415,8 +439,8 @@ export function WorkbenchView() {
                 <>
                   <button
                     type="button"
-                    onClick={() => patchTurn(turn.id, { sourcesOpen: !turn.sourcesOpen })}
-                    aria-expanded={Boolean(turn.sourcesOpen)}
+                    onClick={() => patchTurn(turn.id, { sourcesOpen: !sourcesOpen })}
+                    aria-expanded={sourcesOpen}
                     aria-controls={`sources-${turn.id}`}
                     className="mb-3 flex items-center gap-2 text-[11px] font-extrabold uppercase tracking-[0.12em] opacity-55 hover:opacity-90"
                   >
@@ -424,7 +448,7 @@ export function WorkbenchView() {
                       size={13}
                       aria-hidden
                       style={{
-                        transform: turn.sourcesOpen ? 'rotate(90deg)' : 'none',
+                        transform: sourcesOpen ? 'rotate(90deg)' : 'none',
                         transition: 'transform .18s ease',
                       }}
                     />
@@ -434,10 +458,17 @@ export function WorkbenchView() {
                   {/* Toggled by class, not the `hidden` attribute: Tailwind's
                       `.grid` utility sits in a later layer than preflight's
                       `[hidden]` rule at equal specificity, so it would win and
-                      the collapsed panel would stay on screen. */}
+                      the collapsed panel would stay on screen.
+                      Capped height in the wide layout so a ten-source answer
+                      scrolls its own column instead of setting the height of
+                      the whole panel. */}
                   <div
                     id={`sources-${turn.id}`}
-                    className={turn.sourcesOpen ? 'grid gap-3' : 'hidden'}
+                    className={
+                      sourcesOpen
+                        ? `grid gap-3 ${wide ? 'xl:max-h-[68vh] xl:overflow-y-auto xl:pr-1' : ''}`
+                        : 'hidden'
+                    }
                   >
                     {turn.sources.map((source, index) => {
                       const focused = focusedIndices.includes(index)
@@ -716,43 +747,6 @@ export function WorkbenchView() {
               </div>
             </div>
           </Panel>
-
-          {historyError && (
-            <Panel>
-              <div role="alert" className="p-5 text-[13px]" style={{ border: 'var(--brd-w) solid var(--accent)' }}>
-                {historyError}
-              </div>
-            </Panel>
-          )}
-
-          {historyLoading ? (
-            <Panel>
-              <div className="flex items-center gap-3 p-8 text-[13px] opacity-70"><Spinner size={16} /> Loading saved conversation…</div>
-            </Panel>
-          ) : emptyTranscript ? (
-            <Panel>
-              <div className="grid gap-3 p-11">
-                <div className="flex gap-1">
-                  <span className="h-2 w-2 rounded-full bg-[var(--accent)] opacity-80" />
-                  <span className="h-2 w-2 rounded-full bg-[var(--accent)] opacity-50" />
-                  <span className="h-2 w-2 rounded-full bg-[var(--accent)] opacity-30" />
-                </div>
-                <div className="text-[19px] font-extrabold tracking-[-0.02em]">
-                  {hasExistingIndex ? 'Ask something specific.' : 'Ingest a document first.'}
-                </div>
-                <div className="max-w-[52ch] text-[13.5px] leading-[1.55] opacity-65">
-                  {hasExistingIndex
-                    ? 'Questions are answered only from this document. Anything it cannot support, it will say so rather than invent.'
-                    : 'Nothing is selected yet. Drop a document into the ingest panel and the transcript starts here.'}
-                </div>
-              </div>
-            </Panel>
-          ) : (
-            // Only the newest turn renders here — everything before it is in
-            // the history rail (third column) instead of stacking on top of
-            // the answer someone just asked for.
-            latestTurn && <Panel key={latestTurn.id}>{renderTurnBody(latestTurn)}</Panel>
-          )}
         </div>
 
         {hasRail && (
@@ -814,6 +808,49 @@ export function WorkbenchView() {
             </Panel>
           </div>
         )}
+
+        {/* The answer gets the full page width on its own row, rather than
+            being confined to the query column with the rest of the viewport
+            left blank beside it. Its internal split (prose | sources) is what
+            actually consumes that width — see renderTurnBody's `wide`. */}
+        <div className={`grid min-w-0 gap-7 lg:col-span-2 ${hasRail ? 'xl:col-span-3' : ''}`}>
+          {historyError && (
+            <Panel>
+              <div role="alert" className="p-5 text-[13px]" style={{ border: 'var(--brd-w) solid var(--accent)' }}>
+                {historyError}
+              </div>
+            </Panel>
+          )}
+
+          {historyLoading ? (
+            <Panel>
+              <div className="flex items-center gap-3 p-8 text-[13px] opacity-70"><Spinner size={16} /> Loading saved conversation…</div>
+            </Panel>
+          ) : emptyTranscript ? (
+            <Panel>
+              <div className="grid gap-3 p-11">
+                <div className="flex gap-1">
+                  <span className="h-2 w-2 rounded-full bg-[var(--accent)] opacity-80" />
+                  <span className="h-2 w-2 rounded-full bg-[var(--accent)] opacity-50" />
+                  <span className="h-2 w-2 rounded-full bg-[var(--accent)] opacity-30" />
+                </div>
+                <div className="text-[19px] font-extrabold tracking-[-0.02em]">
+                  {hasExistingIndex ? 'Ask something specific.' : 'Ingest a document first.'}
+                </div>
+                <div className="max-w-[52ch] text-[13.5px] leading-[1.55] opacity-65">
+                  {hasExistingIndex
+                    ? 'Questions are answered only from this document. Anything it cannot support, it will say so rather than invent.'
+                    : 'Nothing is selected yet. Drop a document into the ingest panel and the transcript starts here.'}
+                </div>
+              </div>
+            </Panel>
+          ) : (
+            // Only the newest turn renders here — everything before it is in
+            // the history rail instead of stacking on top of the answer
+            // someone just asked for.
+            latestTurn && <Panel key={latestTurn.id}>{renderTurnBody(latestTurn, true)}</Panel>
+          )}
+        </div>
 
         {/* Pipeline and Collections are reference material, not part of the
             ask-and-read loop — full width underneath, so neither pushes the
