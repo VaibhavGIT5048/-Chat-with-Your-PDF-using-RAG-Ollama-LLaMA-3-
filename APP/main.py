@@ -19,6 +19,7 @@ from slowapi.util import get_remote_address
 
 from APP import auth, db, jobs
 from APP.auth import email as otp_email
+from APP.providers.chat import ContentFilterError
 from APP.rag.service import RAGService
 from APP.rag.vector_store import warm_reranker
 from APP.auth import get_current_user
@@ -367,6 +368,8 @@ def create_app() -> FastAPI:
             response = await asyncio.to_thread(service.answer, current_user["id"], payload, x_openai_api_key)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ContentFilterError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

@@ -12,6 +12,17 @@ import os
 from openai import BadRequestError, OpenAI
 
 
+class ContentFilterError(Exception):
+    """Azure OpenAI's Responsible AI filter blocked the request or response.
+
+    Raised instead of letting BadRequestError propagate as an unhandled 500 —
+    a content-filter trip is an expected, user-facing outcome (422), not a
+    server fault. Distinct from the general BadRequestError re-raise in
+    _create() below: that one is for a param the model rejects, which is a
+    bug in our own request; this one is Azure refusing to answer at all.
+    """
+
+
 class ChatProvider:
     chat_model: str
     # Reasoning-family models (gpt-5-mini included) burn part of their
@@ -47,7 +58,29 @@ class ChatProvider:
                 response = self.client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content or ""
             except BadRequestError as exc:
-                bad_param = getattr(exc, "body", None) and exc.body.get("param")
+                # The SDK sets .body to the *inner* error object already
+                # (openai._client.OpenAI._make_status_error unwraps
+                # response_json["error"] before constructing the exception),
+                # so this reads the same top-level keys the raw API error
+                # carries — {message, type, param, code, ...} — not a
+                # {"error": {...}} wrapper.
+                body = getattr(exc, "body", None) or {}
+                code = body.get("code") if isinstance(body, dict) else None
+                if code == "content_filter":
+                    # Azure's Responsible AI layer sits in front of the model
+                    # and can refuse a request outright — most relevantly here,
+                    # its jailbreak classifier does not distinguish text that
+                    # DESCRIBES injection/jailbreak patterns (our own system
+                    # prompt, defending against them) from text that IS one.
+                    # Dense defensive vocabulary — "ignore", "override",
+                    # "jailbreak payload" — reads the same to the classifier
+                    # either way.
+                    raise ContentFilterError(
+                        "This question could not be answered: Azure's safety "
+                        "filter flagged the request. Try rephrasing the "
+                        "question."
+                    ) from exc
+                bad_param = body.get("param") if isinstance(body, dict) else None
                 if bad_param and bad_param in kwargs:
                     kwargs.pop(bad_param)
                     continue
