@@ -63,8 +63,9 @@ INJECTION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 # internal identifiers a user should never see.
 OUTPUT_LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("system_prompt_leak", re.compile(
-        r"SECURITY RULES \(enforced every turn|INSTRUCTION OVERRIDE DEFENSE|"
-        r"PROMPT EXTRACTION DEFENSE|IDENTITY \(permanent|UNTRUSTED DATA BOUNDARY", re.I)),
+        r"SECURITY RULES \(enforced every turn|INSTRUCTIONS COME FROM HERE ONLY|"
+        r"PROMPT EXTRACTION DEFENSE|IDENTITY \(permanent|UNTRUSTED DATA BOUNDARY|"
+        r"MULTI-TURN CONSISTENCY|NO RE-ENCODED OUTPUT", re.I)),
     ("boundary_marker_leak", re.compile(
         r"<<<UNTRUSTED_DATA_CONTEXT_(?:START|END)>>>")),
     ("infrastructure_leak", re.compile(
