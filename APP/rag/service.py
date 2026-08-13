@@ -18,6 +18,7 @@ from qdrant_client import QdrantClient
 from APP import db
 from APP.rag import cache as doc_cache
 from APP.rag.chunking import chunk_documents, save_chunks_jsonl
+from APP.rag.generator import SYSTEM_PROMPT
 from APP.parsers import parse_document
 from APP.providers import (
     ChatProvider,
@@ -28,6 +29,7 @@ from APP.providers import (
     build_default_embedding_provider,
 )
 from APP.security import (
+    build_rag_payload,
     build_rewrite_payload,
     detect_injection,
     neutralize_context,
@@ -407,6 +409,17 @@ class RAGService:
             openai=openai_status,
             collection_name=self.settings.qdrant_collection,
         )
+
+    @staticmethod
+    def _build_prompt(question: str, context_blob: str) -> str:
+        """Build the legacy fenced representation used by the guardrail audit.
+
+        Production generation uses ``_build_compact_messages`` so Azure sees
+        role-separated, concise instructions. This retained representation is
+        deliberately kept for the boundary regression test: it proves that a
+        document cannot forge or close the untrusted-data fence.
+        """
+        return f"{SYSTEM_PROMPT}\n\n{build_rag_payload(question, [context_blob])}"
 
     def _check_chat_provider(self) -> bool:
         """Probe chat-provider reachability, cached for CHAT_HEALTH_TTL seconds.
